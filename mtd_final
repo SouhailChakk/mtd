@@ -86,7 +86,7 @@ class MovingTargetDefense(app_manager.RyuApp):
         # VIP resource pool
         self.Resources = self._generate_vips("10.0.0.9", self.NUM_VIPS)
 
-        # sessions: session_table[(src_ip, dst_ip)] -> dict(...)
+        # sessions: session_table[(client_ip, vip_dst, proto, sport, dport)] -> dict(...)
         self.session_table = {}
         self.waiting_for_stats = False
         
@@ -128,18 +128,32 @@ class MovingTargetDefense(app_manager.RyuApp):
             (o[2] ^ o[3]) & 0xFF
         )
 
-    def _session_key(self, *, client_ip, vip_dst, proto, sport=None, dport=None):
+    def _session_key(self, *, client_ip, vip_dst, proto, sport=None, dport=None,
+                     icmp_id=None, icmp_type=None, icmp_code=None):
         """
-        - TCP/UDP: (client_ip, vip_dst, proto, sport, dport)
-        - ICMP/others: (client_ip, vip_dst, proto, 0, 0)
-        This prevents collisions and lets one client ping many VIPs at once.
+        Build a canonical 5-tuple for client -> VIP sessions.
+
+        - TCP/UDP use transport ports directly.
+        - ICMP sessions are keyed off the echo identifier (if present) so each
+          ping conversation gets its own slot. Fallback to type/code for other
+          ICMP traffic.
+        - Everything else collapses to zeroed ports which is acceptable because
+          we do not track per-flow state for them.
         """
-        sport = int(sport or 0)
-        dport = int(dport or 0)
-        if proto not in (6, 17):  # TCP=6, UDP=17
+        proto = int(proto or 0)
+        if proto in (6, 17):  # TCP=6, UDP=17
+            sport = int(sport or 0)
+            dport = int(dport or 0)
+        elif proto == 1:  # ICMP
+            if icmp_id is not None:
+                sport = int(icmp_id) & 0xFFFF
+            else:
+                sport = int(icmp_type or 0) & 0xFF
+            dport = ((int(icmp_type or 0) & 0xFF) << 8) | (int(icmp_code or 0) & 0xFF)
+        else:
             sport = 0
             dport = 0
-        return (client_ip, vip_dst, int(proto or 0), sport, dport)
+        return (client_ip, vip_dst, proto, sport, dport)
 
     def _is_reverse_traffic(self, *, src_ip, dst_ip):
         """
@@ -172,8 +186,7 @@ class MovingTargetDefense(app_manager.RyuApp):
 
     def _vip_has_live_sessions(self, vip):
         for key in self.session_table.keys():
-            _, vip_dst, _, _, _ = key
-            if vip_dst == vip:
+            if len(key) >= 2 and key[1] == vip:
                 return True
         return False
 
@@ -328,7 +341,8 @@ class MovingTargetDefense(app_manager.RyuApp):
         dp.send_msg(mod)
 
     # ---------------- stats ----------------
-    def _send_flow_stats(self, dp, src_ip, dst_ip, proto=None, sport=None, dport=None):
+    def _send_flow_stats(self, dp, src_ip, dst_ip, proto=None, sport=None, dport=None,
+                         icmp_type=None, icmp_code=None):
         parser = dp.ofproto_parser
         ofp = dp.ofproto
         kw = dict(eth_type=0x0800, ipv4_src=src_ip, ipv4_dst=dst_ip)
@@ -342,9 +356,45 @@ class MovingTargetDefense(app_manager.RyuApp):
             if dport is not None: kw.update(udp_dst=dport)
         elif proto == 1:
             kw.update(ip_proto=1)
+            if icmp_type is not None:
+                kw.update(icmpv4_type=icmp_type)
+            if icmp_code is not None:
+                kw.update(icmpv4_code=icmp_code)
         match = parser.OFPMatch(**kw)
         req = parser.OFPFlowStatsRequest(dp, 0, ofp.OFPTT_ALL, ofp.OFPP_ANY, ofp.OFPG_ANY, 0, 0, match)
         dp.send_msg(req)
+
+    def _session_key_from_match(self, match):
+        client_ip = match.get('ipv4_src')
+        vip_dst = match.get('ipv4_dst')
+        if not client_ip or not vip_dst:
+            return None
+
+        proto = match.get('ip_proto')
+        if proto == 6:
+            sport = match.get('tcp_src')
+            dport = match.get('tcp_dst')
+            return self._session_key(client_ip=client_ip, vip_dst=vip_dst, proto=proto,
+                                     sport=sport, dport=dport)
+        if proto == 17:
+            sport = match.get('udp_src')
+            dport = match.get('udp_dst')
+            return self._session_key(client_ip=client_ip, vip_dst=vip_dst, proto=proto,
+                                     sport=sport, dport=dport)
+        if proto == 1:
+            icmp_type = match.get('icmpv4_type')
+            icmp_code = match.get('icmpv4_code')
+            key = self._session_key(client_ip=client_ip, vip_dst=vip_dst, proto=proto,
+                                     icmp_type=icmp_type, icmp_code=icmp_code)
+            if key in self.session_table:
+                return key
+            encoded = ((int(icmp_type or 0) & 0xFF) << 8) | (int(icmp_code or 0) & 0xFF)
+            for candidate in self.session_table.keys():
+                if (len(candidate) >= 5 and candidate[0] == client_ip and candidate[1] == vip_dst and
+                        candidate[2] == 1 and candidate[4] == encoded):
+                    return candidate
+            return key
+        return self._session_key(client_ip=client_ip, vip_dst=vip_dst, proto=proto)
 
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def _on_flow_stats_reply(self, ev):
@@ -354,10 +404,8 @@ class MovingTargetDefense(app_manager.RyuApp):
 
         for stat in body:
             match = stat.match
-            src = match.get('ipv4_src')
-            dst = match.get('ipv4_dst')
-            if not src or not dst: continue
-            session_key = (src, dst)
+            session_key = self._session_key_from_match(match)
+            if not session_key: continue
             if session_key not in self.session_table: continue
             s = self.session_table[session_key]
             if s['datapath'].id != dp.id: continue
@@ -373,22 +421,20 @@ class MovingTargetDefense(app_manager.RyuApp):
                 delta = pkt_count - prev
                 s['packet_count'] = pkt_count
                 s['last_growth'] = now
+                src = s.get('client_ip') or session_key[0]
+                dst = s.get('vip_dst') or session_key[1]
                 self.logger.info("STATS: growth %s -> %s (+%d) pkts=%d", src, dst, delta, pkt_count)
                 # Session-level activity: touch destination VIP only
                 vip_dst = s.get('vip_dst')
                 if vip_dst and vip_dst in self.V2R_Mappings:
                     self._touch_vip(vip_dst, now, "stats growth: vip_dst")
             else:
-                age = now - (s.get('last_growth') or s['timestamp'])
+                age = now - (s.get('last_growth') or s.get('timestamp', now))
                 if age > self.SESSION_NO_GROWTH_TIMEOUT:
+                    src = s.get('client_ip') or session_key[0]
+                    dst = s.get('vip_dst') or session_key[1]
                     self.logger.info("SESSION: drop %s -> %s (%.1fs no growth)", src, dst, age)
-                    # decrement active session counter for vip_dst
-                    vip_dst = s.get('vip_dst')
-                    if vip_dst:
-                        self.vip_active_sessions[vip_dst] = max(0, self.vip_active_sessions.get(vip_dst, 1) - 1)
-                        if self.vip_active_sessions.get(vip_dst, 0) == 0:
-                            self._start_idle_timer(vip_dst, now, "no active sessions")
-                    self._remove_session(dst, src)
+                    self._remove_session(session_key, reason="no stats growth")
 
     # ---------------- housekeeping ----------------
     @set_ev_cls(EventMessage)
@@ -397,8 +443,21 @@ class MovingTargetDefense(app_manager.RyuApp):
         # 1) poll sessions
         total = 0
         for session_key, s in list(self.session_table.items()):
-            src_ip, dst_ip = session_key
-            self._send_flow_stats(s['datapath'], src_ip, dst_ip, s.get('proto'), s.get('src_port'), s.get('dst_port'))
+            proto = s.get('proto')
+            if proto in (6, 17) and not self.TCPUDP_INSTALL_FLOWS:
+                continue
+            if proto == 1 and not self.ICMP_INSTALL_FLOWS:
+                continue
+            self._send_flow_stats(
+                s['datapath'],
+                s.get('client_ip') or session_key[0],
+                s.get('vip_dst') or session_key[1],
+                proto,
+                s.get('src_port'),
+                s.get('dst_port'),
+                s.get('icmp_type'),
+                s.get('icmp_code'),
+            )
             total += 1
         self.logger.info("STATS: polled %d sessions", total)
 
@@ -540,6 +599,11 @@ class MovingTargetDefense(app_manager.RyuApp):
         proto = ip4.proto
         sport = (tcp_pkt and tcp_pkt.src_port) or (udp_pkt and udp_pkt.src_port) or 0
         dport = (tcp_pkt and tcp_pkt.dst_port) or (udp_pkt and udp_pkt.dst_port) or 0
+        icmp_type = icmp_pkt.type if icmp_pkt else None
+        icmp_code = icmp_pkt.code if icmp_pkt else None
+        icmp_id = None
+        if icmp_pkt and hasattr(icmp_pkt, 'data') and hasattr(icmp_pkt.data, 'id'):
+            icmp_id = icmp_pkt.data.id
 
         # --- FAST PATH: reverse VIP -> real traffic ---
         if self._is_reverse_traffic(src_ip=src_ip, dst_ip=dst_ip):
@@ -560,11 +624,46 @@ class MovingTargetDefense(app_manager.RyuApp):
             self.reply_vip_pair[(real_srv, client_ip, proto, 0, 0)] = vip_dst
 
         # (b) Create/lookup session using the TRUE flow key
-        flow_key = self._session_key(client_ip=client_ip, vip_dst=vip_dst, proto=proto, sport=sport, dport=dport)
+        flow_key = self._session_key(client_ip=client_ip, vip_dst=vip_dst, proto=proto,
+                                     sport=sport, dport=dport, icmp_id=icmp_id,
+                                     icmp_type=icmp_type, icmp_code=icmp_code)
         sess = self.session_table.get(flow_key)
+        now = time()
         if not sess:
-            sess = {'client_ip': client_ip, 'vip_dst': vip_dst, 'proto': proto, 'sport': sport, 'dport': dport, 'created': time()}
+            sess = {
+                'datapath': dp,
+                'client_ip': client_ip,
+                'vip_dst': vip_dst,
+                'proto': proto,
+                'src_port': sport,
+                'dst_port': dport,
+                'icmp_type': icmp_type,
+                'icmp_code': icmp_code,
+                'icmp_id': icmp_id,
+                'timestamp': now,
+                'last_growth': now,
+                'packet_count': None,
+                'created': now,
+            }
             self.session_table[flow_key] = sess
+            if vip_dst:
+                self.vip_active_sessions[vip_dst] = self.vip_active_sessions.get(vip_dst, 0) + 1
+                self._touch_vip(vip_dst, now, "session create: vip_dst")
+            self.logger.info("SESSION: created %s -> %s (proto %d) key=%s",
+                             client_ip, vip_dst, proto, flow_key)
+        else:
+            sess.update({
+                'datapath': dp,
+                'timestamp': now,
+                'client_ip': client_ip,
+                'vip_dst': vip_dst,
+                'proto': proto,
+                'src_port': sport,
+                'dst_port': dport,
+                'icmp_type': icmp_type,
+                'icmp_code': icmp_code,
+                'icmp_id': icmp_id,
+            })
 
         # (c) Pick/pin SNAT VIP for THIS flow
         snat_vip = self._choose_snat_vip(flow_key=flow_key, client_ip=client_ip, vip_dst=vip_dst)
@@ -576,73 +675,37 @@ class MovingTargetDefense(app_manager.RyuApp):
                                        client_ip, vip_dst, real_srv, snat_vip)
 
         # (e) Update per-VIP timestamps so timers tick independently
-        now = time()
-        self.vip_last_seen[vip_dst] = now
-        self.vip_last_seen[snat_vip] = now
+        if vip_dst:
+            self.vip_last_seen[vip_dst] = now
+        if snat_vip:
+            self.vip_last_seen[snat_vip] = now
 
     # ---------------- sessions ----------------
-    def _get_or_create_session(self, dp, src_ip, dst_ip, proto, src_port, dst_port, now, msg):
-        # Use a consistent key for session lookup (src,dst) as seen on wire
-        session_key = (src_ip, dst_ip)
-        
-        # Existing session
-        if session_key in self.session_table:
-            s = self.session_table[session_key]
-            s['timestamp'] = now
-            return s
+    def _remove_session(self, session_key, reason=""):
+        session = self.session_table.pop(session_key, None)
+        if not session:
+            return
 
-        # Meaningful traffic check (session-level granularity)
-        meaningful = (proto in (1, 17))
-        if proto == 6 and not meaningful:
-            tcp_flags = 0
-            try:
-                t = packet.Packet(msg.data).get_protocol(tcp.tcp)
-                tcp_flags = t.bits if t else 0
-            except Exception:
-                pass
-            has_data = len(msg.data) > 54
-            is_control = (tcp_flags & 0x02) or (tcp_flags & 0x10) or (tcp_flags & 0x01)
-            meaningful = has_data and not is_control
+        vip_dst = session.get('vip_dst')
+        if not vip_dst and len(session_key) >= 2:
+            vip_dst = session_key[1]
 
-        if not meaningful:
-            return None
-
-        # Only sessions for real->VIP traffic (client->server)
-        if src_ip in self.V2R_Mappings:
-            return None  # No sessions for VIP->anything
-        if dst_ip not in self.V2R_Mappings:
-            return None  # No sessions for real->real
-
-        vip_dst = None
-        if dst_ip in self.V2R_Mappings and src_ip not in self.V2R_Mappings:
-            if not self._is_return_path_session(src_ip, dst_ip):
-                vip_dst = dst_ip  # real client -> destination VIP
-
-        self.session_table[session_key] = {
-            'datapath': dp,
-            'timestamp': now,
-            'last_growth': now,
-            'packet_count': None,
-            'proto': proto,
-            'src_port': src_port,
-            'dst_port': dst_port,
-            'vip_dst': vip_dst,
-        }
-        
-        # Touch vip_dst on NEW session creation and bump session counter
         if vip_dst:
-            self.vip_active_sessions[vip_dst] = self.vip_active_sessions.get(vip_dst, 0) + 1
-            self._touch_vip(vip_dst, now, "session create: vip_dst")
-        
-        self.logger.info("SESSION: created %s -> %s (proto %d) vip_dst=%s (key=%s)",
-                         src_ip, dst_ip, proto, vip_dst, session_key)
-        return self.session_table[session_key]
+            current = self.vip_active_sessions.get(vip_dst, 0)
+            if current > 0:
+                self.vip_active_sessions[vip_dst] = current - 1
+            if self.vip_active_sessions.get(vip_dst, 0) == 0:
+                self._start_idle_timer(vip_dst, time(), "session removed")
 
-    def _remove_session(self, dst_ip, src_ip):
-        session_key = (src_ip, dst_ip)
-        if session_key in self.session_table:
-            self.session_table.pop(session_key, None)
-            self.logger.info("SESSION: removed %s -> %s", src_ip, dst_ip)
+        src = session.get('client_ip') or (session_key[0] if len(session_key) >= 1 else None)
+        dst = session.get('vip_dst') or (session_key[1] if len(session_key) >= 2 else None)
+        snat_vip = self._snat_binding.pop(session_key, None)
+        if src and dst:
+            self.logger.info("SESSION: removed %s -> %s%s", src, dst,
+                             f" ({reason})" if reason else "")
+            if snat_vip:
+                self.logger.info("SNAT_BIND: cleared due to session removal for flow %s -> %s (VIP %s)",
+                                 src, dst, snat_vip)
 
     # ---------------- VIP helpers ----------------
     def _allocate_vip_to_host(self, real_ip, now, announce=True):
@@ -848,9 +911,8 @@ class MovingTargetDefense(app_manager.RyuApp):
 
         # drop sessions that reference this VIP as dst
         for session_key, s in list(self.session_table.items()):
-            if s.get('vip_dst') == vip:
-                src_ip, dst_ip = session_key
-                self._remove_session(dst_ip, src_ip)
+            if s.get('vip_dst') == vip or (len(session_key) >= 2 and session_key[1] == vip):
+                self._remove_session(session_key, reason="vip reclaim")
 
         # purge flows that match this VIP anywhere
         self._purge_flows_for_vip(vip)
@@ -989,12 +1051,11 @@ class MovingTargetDefense(app_manager.RyuApp):
         in the reverse direction. Return path sessions are server->client responses
         where the server is using a SNAT VIP to reply to the client.
         """
-        # Look for existing session in reverse direction
-        reverse_key = (dst_ip, src_ip)
-        if reverse_key in self.session_table:
-            reverse_session = self.session_table[reverse_key]
-            # If the reverse session has a vip_dst, this is likely a return path
-            if reverse_session.get('vip_dst'):
+        for key, reverse_session in self.session_table.items():
+            if len(key) < 2:
+                continue
+            client_ip, vip_dst = key[0], key[1]
+            if client_ip == dst_ip and vip_dst == src_ip and reverse_session.get('vip_dst'):
                 return True
         return False
 
