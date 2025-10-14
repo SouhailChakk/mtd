@@ -80,7 +80,7 @@ class MovingTargetDefense(app_manager.RyuApp):
         # Per-flow SNAT binding (Option A)
         # Forward flow key: (client_real, dst_vip, proto, sport, dport) -> vip_src
         self._snat_binding = {}
-        # Reverse flow key: (server_real, vip_src, proto, dport, sport) -> client_real
+        # Reverse flow key -> canonical session flow key (client->VIP 5-tuple)
         self._snat_reverse = {}
 
         # VIP resource pool
@@ -155,6 +155,19 @@ class MovingTargetDefense(app_manager.RyuApp):
             dport = 0
         return (client_ip, vip_dst, proto, sport, dport)
 
+    def _reverse_flow_key(self, *, src_ip, dst_ip, proto, sport=None, dport=None,
+                          icmp_id=None, icmp_type=None, icmp_code=None):
+        proto = int(proto or 0)
+        if proto in (6, 17):
+            return (src_ip, dst_ip, proto, int(sport or 0), int(dport or 0))
+        if proto == 1:
+            if icmp_id is not None:
+                ident = int(icmp_id) & 0xFFFF
+            else:
+                ident = ((int(icmp_type or 0) & 0xFF) << 8) | (int(icmp_code or 0) & 0xFF)
+            return (src_ip, dst_ip, proto, ident)
+        return (src_ip, dst_ip, proto, 0)
+
     def _is_reverse_traffic(self, *, src_ip, dst_ip):
         """
         Reverse traffic = source is any VIP we manage; destination is a real host.
@@ -217,41 +230,90 @@ class MovingTargetDefense(app_manager.RyuApp):
             if reclaim_left <= 0 and not self._vip_has_live_sessions(vip):
                 self._reclaim_vip(vip)
 
-    def _forward_reverse(self, dp, in_port, pkt, eth, ip4, proto):
+    def _forward_reverse(self, dp, in_port, pkt, eth, ip4, proto,
+                         sport=None, dport=None, icmp_id=None,
+                         icmp_type=None, icmp_code=None):
         """
-        Forward VIP->real packets without creating a new session.
-        Reuse your existing reverse/SNAT maps and flow mods here.
+        Handle packets that belong to an existing session but arrive in the
+        opposite direction (either VIP->real or real->SNAT VIP). We do not
+        create a new session; instead reuse the stored bindings and forward
+        accordingly. Returns True if handled.
         """
-        src_ip = ip4.src
-        dst_ip = ip4.dst
-        
-        # Look up reverse mapping for SNAT VIP
-        snat_vip = None
-        for (server_real, vip_src, p, dport, sport), client_real in self._snat_reverse.items():
-            if server_real == dst_ip and vip_src == src_ip and p == proto:
-                snat_vip = vip_src
-                break
-        
-        if snat_vip:
-            # Apply reverse SNAT and forward
-            parser = dp.ofproto_parser
-            actions = [
+        reverse_key = self._reverse_flow_key(
+            src_ip=ip4.src,
+            dst_ip=ip4.dst,
+            proto=proto,
+            sport=sport,
+            dport=dport,
+            icmp_id=icmp_id,
+            icmp_type=icmp_type,
+            icmp_code=icmp_code,
+        )
+        flow_key = self._snat_reverse.get(reverse_key)
+        if not flow_key:
+            return False
+
+        session = self.session_table.get(flow_key)
+        if not session:
+            # Stale mapping, drop it so future packets can create a new session
+            self._snat_reverse.pop(reverse_key, None)
+            return False
+
+        client_ip = session.get('client_ip')
+        vip_dst = session.get('vip_dst')
+        snat_vip = session.get('snat_vip')
+        real_srv = session.get('real_srv')
+        if not client_ip or not vip_dst or not snat_vip or not real_srv:
+            return False
+
+        parser = dp.ofproto_parser
+        ofp = dp.ofproto
+        actions = []
+
+        if ip4.src == snat_vip and ip4.dst == real_srv:
+            # Forward path that already has SNAT applied: push it toward the server
+            server_mac = self.host_ip_to_mac.get(real_srv, eth.dst)
+            out_port = self.mac_to_port.get(dp.id, {}).get(server_mac, ofp.OFPP_FLOOD)
+            vip_mac = self.vip_mac_map.get(snat_vip) or self._generate_vip_mac(snat_vip)
+            self.vip_mac_map[snat_vip] = vip_mac
+
+            actions.extend([
                 parser.OFPActionSetField(ipv4_src=snat_vip),
-                parser.OFPActionSetField(eth_src=self.vip_mac_map.get(snat_vip, self._generate_vip_mac(snat_vip)))
-            ]
-            
-            # Find output port for client
-            client_mac = self.host_ip_to_mac.get(dst_ip)
-            if client_mac and client_mac in self.mac_to_port.get(dp.id, {}):
-                out_port = self.mac_to_port[dp.id][client_mac]
-                actions.append(parser.OFPActionOutput(out_port))
-            else:
-                actions.append(parser.OFPActionOutput(dp.ofproto.OFPP_FLOOD))
-            
-            # Send packet
-            dp.send_msg(parser.OFPPacketOut(
-                datapath=dp, buffer_id=dp.ofproto.OFP_NO_BUFFER,
-                in_port=in_port, actions=actions, data=pkt.data))
+                parser.OFPActionSetField(eth_src=vip_mac),
+                parser.OFPActionSetField(ipv4_dst=real_srv),
+                parser.OFPActionSetField(eth_dst=server_mac),
+                parser.OFPActionOutput(out_port),
+            ])
+        elif ip4.src == real_srv and ip4.dst == snat_vip:
+            # Reverse path: translate back to client using the original VIP
+            vip_mac = self.vip_mac_map.get(vip_dst) or self._generate_vip_mac(vip_dst)
+            self.vip_mac_map[vip_dst] = vip_mac
+
+            client_mac = self.host_ip_to_mac.get(client_ip)
+            out_port = self.mac_to_port.get(dp.id, {}).get(client_mac, ofp.OFPP_FLOOD)
+
+            actions.extend([
+                parser.OFPActionSetField(ipv4_src=vip_dst),
+                parser.OFPActionSetField(eth_src=vip_mac),
+                parser.OFPActionSetField(ipv4_dst=client_ip),
+            ])
+            if client_mac:
+                actions.append(parser.OFPActionSetField(eth_dst=client_mac))
+            actions.append(parser.OFPActionOutput(out_port))
+
+            now = time()
+            self.vip_last_seen[vip_dst] = now
+            self.vip_last_seen[snat_vip] = now
+        else:
+            return False
+
+        dp.send_msg(parser.OFPPacketOut(
+            datapath=dp,
+            buffer_id=ofp.OFP_NO_BUFFER,
+            in_port=in_port,
+            actions=actions,
+            data=pkt.data))
+        return True
 
     def _install_flow_for_session(self, dp, in_port, pkt, eth, ip4, proto, sport, dport,
                                   client_ip, vip_dst, real_srv, snat_vip):
@@ -605,12 +667,15 @@ class MovingTargetDefense(app_manager.RyuApp):
         if icmp_pkt and hasattr(icmp_pkt, 'data') and hasattr(icmp_pkt.data, 'id'):
             icmp_id = icmp_pkt.data.id
 
-        # --- FAST PATH: reverse VIP -> real traffic ---
+        # --- FAST PATH: reuse existing session mappings ---
+        if self._forward_reverse(dp, in_port, pkt, eth, ip4, proto,
+                                  sport=sport, dport=dport,
+                                  icmp_id=icmp_id, icmp_type=icmp_type,
+                                  icmp_code=icmp_code):
+            return
+
         if self._is_reverse_traffic(src_ip=src_ip, dst_ip=dst_ip):
-            # Do NOT create a session for reverse traffic.
-            # Use your existing reverse/SNAT maps and push it out.
-            self._forward_reverse(dp, in_port, pkt, eth, ip4, proto)
-            # Update timer for src VIP
+            # Reverse VIP->real without a known session -- nothing to do here.
             self.vip_last_seen[src_ip] = time()
             return
 
@@ -667,6 +732,39 @@ class MovingTargetDefense(app_manager.RyuApp):
 
         # (c) Pick/pin SNAT VIP for THIS flow
         snat_vip = self._choose_snat_vip(flow_key=flow_key, client_ip=client_ip, vip_dst=vip_dst)
+        sess['snat_vip'] = snat_vip
+        if real_srv:
+            sess['real_srv'] = real_srv
+
+        reverse_key = None
+        if real_srv and snat_vip:
+            reverse_key = self._reverse_flow_key(
+                src_ip=real_srv,
+                dst_ip=snat_vip,
+                proto=proto,
+                sport=dport if proto in (6, 17) else None,
+                dport=sport if proto in (6, 17) else None,
+                icmp_id=icmp_id,
+                icmp_type=icmp_type,
+                icmp_code=icmp_code,
+            )
+            if reverse_key:
+                prior_key = sess.get('reverse_key')
+                if prior_key and prior_key != reverse_key:
+                    self._snat_reverse.pop(prior_key, None)
+                sess['reverse_key'] = reverse_key
+                self._snat_reverse[reverse_key] = flow_key
+                if prior_key != reverse_key:
+                    self.logger.info(
+                        "SNAT_REVERSE_BIND: server=%s vip_src=%s proto=%d reverse_key=%s -> flow=%s",
+                        real_srv, snat_vip, proto, reverse_key, flow_key)
+        else:
+            prior_key = sess.get('reverse_key')
+            if prior_key:
+                if self._snat_reverse.pop(prior_key, None) is not None:
+                    self.logger.info(
+                        "SNAT_REVERSE_BIND: cleared due to missing reverse mapping for flow %s", flow_key)
+                sess.pop('reverse_key', None)
 
         # (d) Program your flows for forward & reverse using snat_vip
         #     Call your existing helpers that install DNAT (VIP->real) and SNAT (client->snat_vip) rules.
@@ -699,6 +797,10 @@ class MovingTargetDefense(app_manager.RyuApp):
 
         src = session.get('client_ip') or (session_key[0] if len(session_key) >= 1 else None)
         dst = session.get('vip_dst') or (session_key[1] if len(session_key) >= 2 else None)
+        reverse_key = session.get('reverse_key')
+        if reverse_key and self._snat_reverse.pop(reverse_key, None) is not None:
+            self.logger.info("SNAT_REVERSE_BIND: cleared due to session removal for flow %s", session_key)
+
         snat_vip = self._snat_binding.pop(session_key, None)
         if src and dst:
             self.logger.info("SESSION: removed %s -> %s%s", src, dst,
