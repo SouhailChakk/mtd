@@ -393,7 +393,7 @@ class MovingTargetDefense(app_manager.RyuApp):
                 forward_dst_mac = dst_mac
             if not session.vip_dst:
                 session.vip_dst = vip_dst
-            if proto != 1 and not session.vip_locked:
+            if not session.vip_locked:
                 session.vip_locked = vip_dst
             self._touch_vip(vip_dst, now, "session create: vip_dst")
             self._register_reply_mapping(session, server_real, client_real,
@@ -420,36 +420,16 @@ class MovingTargetDefense(app_manager.RyuApp):
             if not forward_dst_mac:
                 forward_dst_mac = self.host_ip_to_mac.get(server_real)
         else:  # reverse direction (server -> client)
-            mapping_vip = self._select_reply_vip_5tuple(server_real, client_real,
-                                                        proto, client_port, server_port)
-            if proto == 1:
-                vip_src = mapping_vip
-            else:
-                vip_src = session.vip_locked or mapping_vip
-
-            if vip_src and self.V2R_Mappings.get(vip_src) != server_real:
-                vip_src = None
-
-            if not vip_src and mapping_vip and self.V2R_Mappings.get(mapping_vip) == server_real:
-                vip_src = mapping_vip
-
-            if not vip_src:
-                vip_src = self._choose_outbound_vip(server_real, now)
-                if not vip_src:
-                    vip_src = self._allocate_vip_to_host(server_real, now, announce=True)
-                if vip_src:
-                    self._mark_vip_reuse(vip_src, now)
-
+            vip_src = session.vip_locked or self._select_reply_vip_5tuple(server_real, client_real,
+                                                                         proto, client_port, server_port)
             if vip_src:
-                if proto != 1:
-                    session.vip_locked = vip_src
+                session.vip_locked = vip_src
                 self._touch_vip(vip_src, now, "reply packet")
                 mac = self.vip_mac_map.get(vip_src) or self._generate_vip_mac(vip_src)
                 self.vip_mac_map[vip_src] = mac
                 actions.append(parser.OFPActionSetField(ipv4_src=vip_src))
                 actions.append(parser.OFPActionSetField(eth_src=mac))
                 self.vip_active_sessions.setdefault(vip_src, set()).add(session_key)
-                self._send_targeted_arp_to_host_for_vip(vip_src, client_real)
             client_mac = self.host_ip_to_mac.get(client_real)
             if client_mac:
                 actions.append(parser.OFPActionSetField(eth_dst=client_mac))
