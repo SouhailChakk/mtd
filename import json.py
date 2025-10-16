@@ -37,6 +37,8 @@ class SessionRecord:
     last_contacted_vip: Optional[str] = None
     last_vip_src_use: float = 0.0
     last_vip_src_announce: float = 0.0
+    active_target_vip: Optional[str] = None
+    vip_src_by_target: Dict[str, str] = field(default_factory=dict)
     src_ip_initial: str = ""
     dst_ip_initial: str = ""
     reverse_src_initial: str = ""
@@ -60,10 +62,10 @@ class MovingTargetDefense(app_manager.RyuApp):
     VIPS_PER_HOST = 5                # per-host target
     VIP_IDLE_TIMEOUT = 60            # reclaim after this idle grace (s)
     SESSION_NO_GROWTH_TIMEOUT = 15   # session "quiet" threshold (s)
-    HOUSEKEEPING_INTERVAL = 5        # periodic tick (s)
+    HOUSEKEEPING_INTERVAL = 15        # periodic tick (s)
     DISCOVERY_RANGE_LAST_OCTET_MAX = 10  # discover 10.0.0.1..10.0.0.10
     VIP_COOLING_PERIOD = 60          # seconds before reclaimed VIP can be reassigned
-    VIP_REUSE_COOLDOWN = 5           # avoid re-using a VIP immediately after release
+    VIP_REUSE_COOLDOWN = 15           # avoid re-using a VIP immediately after release
 
     INITIAL_ASSIGN_ON_DISCOVERY = True
     AUTO_TOPUP_IN_HOUSEKEEPING = True
@@ -435,21 +437,66 @@ class MovingTargetDefense(app_manager.RyuApp):
                 self.session_last_contacted_vip[flow_key] = vip_dst
 
         if direction == 'forward':
+            binding_vip = None
+            if vip_dst:
+                bound = session.vip_src_by_target.get(vip_dst)
+                if bound and self.V2R_Mappings.get(bound) == client_real:
+                    binding_vip = bound
+                elif bound:
+                    session.vip_src_by_target.pop(vip_dst, None)
+
             vip_src = session.vip_src
             need_new_vip = False
+            
+            previous_target = session.active_target_vip
+            freed_previous = False
+            previous_vip_src = None
+
+            if binding_vip and vip_src and vip_src != binding_vip:
+                previous_vip_src = vip_src
+                previous_target = session.active_target_vip
+                freed_previous = self._detach_session_from_vip(previous_vip_src, session_key)
+                self._mark_vip_reuse(previous_vip_src, now)
+                if freed_previous:
+                    self._flag_vip_idle(previous_vip_src, now, "snat target switch")
+                session.vip_src = None
+                vip_src = None
+                session.active_target_vip = None
+                if previous_target:
+                    session.vip_src_by_target.pop(previous_target, None)
+                previous_vip_src = None
+                previous_target = None
+
+            if binding_vip and not vip_src:
+                vip_src = binding_vip
+                session.vip_src = vip_src
+                session.active_target_vip = vip_dst
+                session.vip_src_by_target[vip_dst] = vip_src
+                self.vip_active_sessions.setdefault(vip_src, set()).add(session_key)
+                session.last_vip_src_use = now
+                session.last_vip_src_announce = 0.0
+                self._touch_vip(vip_src, now, "reuse target binding")
+                self._send_targeted_arp_to_host_for_vip(vip_src, server_real)
+                session.last_vip_src_announce = now
 
             if vip_src:
                 owner = self.V2R_Mappings.get(vip_src)
                 if owner != client_real:
+                    previous_vip_src = vip_src
+                    previous_target = session.active_target_vip
                     need_new_vip = True
                 else:
                     elapsed = now - session.last_vip_src_use if session.last_vip_src_use else 0.0
                     if elapsed > self.SESSION_NO_GROWTH_TIMEOUT:
+                        previous_vip_src = vip_src
+                        previous_target = session.active_target_vip
                         need_new_vip = True
                     else:
                         self.vip_active_sessions.setdefault(vip_src, set()).add(session_key)
-                        # Periodically refresh the ARP view if we have been using the
-                        # same VIP for an extended period of time.
+                        if vip_dst:
+                            if session.vip_src_by_target.get(vip_dst) != vip_src:
+                                session.vip_src_by_target[vip_dst] = vip_src
+                        session.active_target_vip = vip_dst
                         if (now - session.last_vip_src_announce) >= self.SESSION_NO_GROWTH_TIMEOUT:
                             self._send_targeted_arp_to_host_for_vip(vip_src, server_real)
                             session.last_vip_src_announce = now
@@ -457,12 +504,19 @@ class MovingTargetDefense(app_manager.RyuApp):
             else:
                 need_new_vip = True
 
-            previous_vip_src = session.vip_src if need_new_vip else None
-            freed_previous = False
-
             if need_new_vip and previous_vip_src:
-                freed_previous = self._detach_session_from_vip(previous_vip_src, session_key)
+                freed_previous = freed_previous or self._detach_session_from_vip(previous_vip_src, session_key)
                 self._mark_vip_reuse(previous_vip_src, now)
+                if freed_previous:
+                    reason = "snat vip rotation"
+                    if previous_target and previous_target != vip_dst:
+                        reason = "snat target switch"
+                    self._flag_vip_idle(previous_vip_src, now, reason)
+                if previous_target:
+                    session.vip_src_by_target.pop(previous_target, None)
+                session.vip_src = None
+                session.active_target_vip = None
+                vip_src = None
 
             if need_new_vip:
                 vip_src = self._choose_outbound_vip(client_real, now)
@@ -477,6 +531,9 @@ class MovingTargetDefense(app_manager.RyuApp):
                         self._flag_vip_idle(previous_vip_src, now, "snat vip rotation")
                 else:
                     session.vip_src = vip_src
+                    session.active_target_vip = vip_dst
+                    if vip_dst:
+                        session.vip_src_by_target[vip_dst] = vip_src
                     session.last_vip_src_use = now
                     session.last_vip_src_announce = 0.0
                     self.vip_active_sessions.setdefault(vip_src, set()).add(session_key)
@@ -484,14 +541,15 @@ class MovingTargetDefense(app_manager.RyuApp):
                     self._mark_vip_reuse(vip_src, now)
                     self._send_targeted_arp_to_host_for_vip(vip_src, server_real)
                     session.last_vip_src_announce = now
-                    if previous_vip_src and vip_src != previous_vip_src and freed_previous:
-                        self._flag_vip_idle(previous_vip_src, now, "snat vip rotation")
 
             if not session.vip_src:
                 pool = list(self.host_vip_pools.get(client_real, set()))
                 if pool:
                     vip_src = random.choice(pool)
                     session.vip_src = vip_src
+                    session.active_target_vip = vip_dst
+                    if vip_dst:
+                        session.vip_src_by_target[vip_dst] = vip_src
                     session.last_vip_src_use = now
                     self.vip_active_sessions.setdefault(vip_src, set()).add(session_key)
                     self._touch_vip(vip_src, now, "fallback vip_src assign")
