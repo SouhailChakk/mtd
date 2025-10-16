@@ -33,6 +33,10 @@ class SessionRecord:
     vip_src: Optional[str] = None
     vip_dst: Optional[str] = None
     vip_locked: Optional[str] = None
+    last_reply_vip: Optional[str] = None
+    last_contacted_vip: Optional[str] = None
+    last_vip_src_use: float = 0.0
+    last_vip_src_announce: float = 0.0
     src_ip_initial: str = ""
     dst_ip_initial: str = ""
     reverse_src_initial: str = ""
@@ -56,7 +60,7 @@ class MovingTargetDefense(app_manager.RyuApp):
     VIPS_PER_HOST = 5                # per-host target
     VIP_IDLE_TIMEOUT = 60            # reclaim after this idle grace (s)
     SESSION_NO_GROWTH_TIMEOUT = 15   # session "quiet" threshold (s)
-    HOUSEKEEPING_INTERVAL = 15        # periodic tick (s)
+    HOUSEKEEPING_INTERVAL = 5        # periodic tick (s)
     DISCOVERY_RANGE_LAST_OCTET_MAX = 10  # discover 10.0.0.1..10.0.0.10
     VIP_COOLING_PERIOD = 60          # seconds before reclaimed VIP can be reassigned
     VIP_REUSE_COOLDOWN = 5           # avoid re-using a VIP immediately after release
@@ -96,6 +100,7 @@ class MovingTargetDefense(app_manager.RyuApp):
         # reply VIP binding (legacy logging expectations)
         self.reply_vip_pair: Dict[Tuple[str, str, int], str] = {}
         self._reply_vip_by_5tuple: Dict[Tuple[str, str, int, int, int], str] = {}
+        self.session_last_contacted_vip: Dict[Tuple[str, str, int, int, int], str] = {}
 
         # VIP resource pool
         self.Resources: List[str] = self._generate_vips("10.0.0.9", self.NUM_VIPS)
@@ -156,6 +161,24 @@ class MovingTargetDefense(app_manager.RyuApp):
         if vip:
             self.vip_recently_used[vip] = ts
 
+    def _detach_session_from_vip(self, vip: Optional[str], session_key: SessionKey) -> bool:
+        if not vip:
+            return False
+        active = self.vip_active_sessions.get(vip)
+        if not active:
+            return True
+        active.discard(session_key)
+        if not active:
+            self.vip_active_sessions.pop(vip, None)
+            return True
+        return False
+
+    def _flag_vip_idle(self, vip: str, ts: float, reason: str) -> None:
+        if not vip:
+            return
+        self._start_idle_timer(vip, ts, reason)
+        self.vip_last_seen[vip] = ts - self.SESSION_NO_GROWTH_TIMEOUT - 1
+
     # ---------------- switch bringup ----------------
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -166,7 +189,7 @@ class MovingTargetDefense(app_manager.RyuApp):
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
         self._add_flow(dp, priority=0, match=match, actions=actions)
-        self.logger.info("[SW] Switch %016x connected", dp.id)
+        self.logger.info("[SW] Switch %016x connected; installed table-miss", dp.id)
 
     def _add_flow(self, dp, priority, match, actions, buffer_id=None, hard_timeout=0, idle_timeout=60):
         parser = dp.ofproto_parser
@@ -205,16 +228,14 @@ class MovingTargetDefense(app_manager.RyuApp):
                 src_ip = session.src_ip_initial or session.key[0]
                 dst_ip = session.dst_ip_initial or session.key[1]
                 self.logger.info("STATS: growth %s -> %s (+%d) pkts=%d",
-                         src_ip, dst_ip, delta, session.packet_count)
+                                 src_ip, dst_ip, delta, session.packet_count)
                 if session.vip_dst:
                     self._touch_vip(session.vip_dst, now, "stats growth: vip_dst")
                 if session.vip_src:
                     self._touch_vip(session.vip_src, now, "stats growth: vip_src")
             else:
                 age = now - session.last_growth
-                # Use longer timeout for ICMP sessions to avoid ping failures
-                timeout = self.SESSION_NO_GROWTH_TIMEOUT * 2 if session.proto == 1 else self.SESSION_NO_GROWTH_TIMEOUT
-                if age > timeout:
+                if age > self.SESSION_NO_GROWTH_TIMEOUT:
                     src_ip = session.src_ip_initial or session.key[0]
                     dst_ip = session.dst_ip_initial or session.key[1]
                     self.logger.info("SESSION: drop %s -> %s (%.1fs no growth)",
@@ -230,22 +251,12 @@ class MovingTargetDefense(app_manager.RyuApp):
             last = self.vip_last_seen.get(vip, self.vip_created_at.get(vip))
             if last is None:
                 continue
-            # Use longer timeout for ICMP VIPs to keep them available
-            has_icmp_mapping = any(v == vip for v in self._reply_vip_by_5tuple.values()) or \
-                              any(v == vip for v in self.reply_vip_pair.values())
-            timeout = self.SESSION_NO_GROWTH_TIMEOUT * 4 if has_icmp_mapping else self.SESSION_NO_GROWTH_TIMEOUT
-            if (now - last) > timeout and not self.vip_active_sessions.get(vip):
+            if (now - last) > self.SESSION_NO_GROWTH_TIMEOUT and not self.vip_active_sessions.get(vip):
                 self._start_idle_timer(vip, now, "housekeeping timeout")
 
         # 3) reclaim past grace
         for vip, owner in list(self.V2R_Mappings.items()):
             if vip not in self.vip_idle_since:
-                continue
-            # Don't reclaim VIPs that have ICMP reply mappings
-            has_icmp_mapping = any(v == vip for v in self._reply_vip_by_5tuple.values()) or \
-                              any(v == vip for v in self.reply_vip_pair.values())
-            if has_icmp_mapping:
-                self.logger.info("PROTECT: VIP %s protected from reclaim (has ICMP mappings)", vip)
                 continue
             if (now - self.vip_idle_since[vip]) >= self.VIP_IDLE_TIMEOUT:
                 self._reclaim_vip(vip)
@@ -264,7 +275,6 @@ class MovingTargetDefense(app_manager.RyuApp):
         if cooling_vips:
             self.logger.info("COOLING: %d VIPs in cooling period: %s",
                              len(cooling_vips), sorted(cooling_vips)[:5])
-            pass
 
         # 7) log snapshot
         self._log_vip_pools(now)
@@ -392,9 +402,6 @@ class MovingTargetDefense(app_manager.RyuApp):
                                                    src_ip, dst_ip, proto)
             self.session_table[session_key] = session
             new_session = True
-            # self.logger.info("SESSION: created %s -> %s (key=%s)", src_ip, dst_ip, session_key)
-        # else:
-            # self.logger.info("SESSION: reused %s -> %s (key=%s)", src_ip, dst_ip, session_key)
 
         vip_dst = None
         forward_dst_mac = None
@@ -407,27 +414,92 @@ class MovingTargetDefense(app_manager.RyuApp):
             if dst_mac:
                 actions.append(parser.OFPActionSetField(eth_dst=dst_mac))
                 forward_dst_mac = dst_mac
-            if not session.vip_dst:
-                session.vip_dst = vip_dst
-            if not session.vip_locked:
+            session.vip_dst = vip_dst
+            session.last_contacted_vip = vip_dst
+            # If replies were previously using a different VIP, detach it so a
+            # reclaimed VIP cannot linger as the preferred reverse mapping.
+            if session.last_reply_vip and session.last_reply_vip != vip_dst:
+                released = self._detach_session_from_vip(session.last_reply_vip, session_key)
+                if released:
+                    self._flag_vip_idle(session.last_reply_vip, now, "forward vip override")
+                self._mark_vip_reuse(session.last_reply_vip, now)
+                session.last_reply_vip = None
+            if proto != 1 and not session.vip_locked:
                 session.vip_locked = vip_dst
             self._touch_vip(vip_dst, now, "session create: vip_dst")
             self._register_reply_mapping(session, server_real, client_real,
                                          proto, vip_dst, client_port, server_port,
                                          icmp_pkt, tcp_pkt, udp_pkt)
+            if direction == 'forward' and vip_dst:
+                flow_key = (client_real, server_real, proto, client_port, server_port)
+                self.session_last_contacted_vip[flow_key] = vip_dst
 
         if direction == 'forward':
             vip_src = session.vip_src
-            if not vip_src:
+            need_new_vip = False
+
+            if vip_src:
+                owner = self.V2R_Mappings.get(vip_src)
+                if owner != client_real:
+                    need_new_vip = True
+                else:
+                    elapsed = now - session.last_vip_src_use if session.last_vip_src_use else 0.0
+                    if elapsed > self.SESSION_NO_GROWTH_TIMEOUT:
+                        need_new_vip = True
+                    else:
+                        self.vip_active_sessions.setdefault(vip_src, set()).add(session_key)
+                        # Periodically refresh the ARP view if we have been using the
+                        # same VIP for an extended period of time.
+                        if (now - session.last_vip_src_announce) >= self.SESSION_NO_GROWTH_TIMEOUT:
+                            self._send_targeted_arp_to_host_for_vip(vip_src, server_real)
+                            session.last_vip_src_announce = now
+                        session.last_vip_src_use = now
+            else:
+                need_new_vip = True
+
+            previous_vip_src = session.vip_src if need_new_vip else None
+            freed_previous = False
+
+            if need_new_vip and previous_vip_src:
+                freed_previous = self._detach_session_from_vip(previous_vip_src, session_key)
+                self._mark_vip_reuse(previous_vip_src, now)
+
+            if need_new_vip:
                 vip_src = self._choose_outbound_vip(client_real, now)
                 if not vip_src:
                     vip_src = self._allocate_vip_to_host(client_real, now, announce=True)
-                session.vip_src = vip_src
-                if vip_src:
+                if not vip_src and previous_vip_src and self.V2R_Mappings.get(previous_vip_src) == client_real:
+                    vip_src = previous_vip_src
+
+                if not vip_src:
+                    session.vip_src = None
+                    if previous_vip_src and freed_previous:
+                        self._flag_vip_idle(previous_vip_src, now, "snat vip rotation")
+                else:
+                    session.vip_src = vip_src
+                    session.last_vip_src_use = now
+                    session.last_vip_src_announce = 0.0
                     self.vip_active_sessions.setdefault(vip_src, set()).add(session_key)
                     self._touch_vip(vip_src, now, "session create: vip_src")
                     self._mark_vip_reuse(vip_src, now)
                     self._send_targeted_arp_to_host_for_vip(vip_src, server_real)
+                    session.last_vip_src_announce = now
+                    if previous_vip_src and vip_src != previous_vip_src and freed_previous:
+                        self._flag_vip_idle(previous_vip_src, now, "snat vip rotation")
+
+            if not session.vip_src:
+                pool = list(self.host_vip_pools.get(client_real, set()))
+                if pool:
+                    vip_src = random.choice(pool)
+                    session.vip_src = vip_src
+                    session.last_vip_src_use = now
+                    self.vip_active_sessions.setdefault(vip_src, set()).add(session_key)
+                    self._touch_vip(vip_src, now, "fallback vip_src assign")
+                    self._mark_vip_reuse(vip_src, now)
+                    # ensure peer learns the VIP MAC before packets flow
+                    self._send_targeted_arp_to_host_for_vip(vip_src, server_real)
+                    session.last_vip_src_announce = now
+
             if session.vip_src:
                 mac = self.vip_mac_map.get(session.vip_src) or self._generate_vip_mac(session.vip_src)
                 self.vip_mac_map[session.vip_src] = mac
@@ -436,22 +508,80 @@ class MovingTargetDefense(app_manager.RyuApp):
             if not forward_dst_mac:
                 forward_dst_mac = self.host_ip_to_mac.get(server_real)
         else:  # reverse direction (server -> client)
+            flow_key = (client_real, server_real, proto, client_port, server_port)
+            mapping_vip = self._select_reply_vip_5tuple(server_real, client_real,
+                                                        proto, client_port, server_port)
+            contacted_vip = self.session_last_contacted_vip.get(flow_key)
+            vip_src = None
+
             if proto == 1:
-                # ICMP: always reply from the contacted VIP
-                vip_src = session.vip_locked or session.vip_dst
-                self.logger.info("REPLY OVERRIDE (ICMP): Using %s for %s->%s (client=%s)", 
-                               vip_src, server_real, client_real, client_real)
+                preferred_vips: List[Optional[str]] = [contacted_vip, mapping_vip, session.last_reply_vip]
+                for candidate in preferred_vips:
+                    if candidate and self.V2R_Mappings.get(candidate) == server_real:
+                        vip_src = candidate
+                        break
             else:
-                vip_src = session.vip_locked or self._select_reply_vip_5tuple(server_real, client_real,
-                                                                             proto, client_port, server_port)
+                ordered: List[Optional[str]] = [session.vip_locked, mapping_vip,
+                                                contacted_vip, session.last_reply_vip]
+                for candidate in ordered:
+                    if candidate and self.V2R_Mappings.get(candidate) == server_real:
+                        vip_src = candidate
+                        break
+
+            if vip_src and self.V2R_Mappings.get(vip_src) != server_real:
+                vip_src = None
+
+            if not vip_src and session.vip_dst and self.V2R_Mappings.get(session.vip_dst) == server_real:
+                vip_src = session.vip_dst
+
+            if not vip_src and mapping_vip and self.V2R_Mappings.get(mapping_vip) == server_real:
+                vip_src = mapping_vip
+
+            if not vip_src and contacted_vip and self.V2R_Mappings.get(contacted_vip) == server_real:
+                vip_src = contacted_vip
+
+            if not vip_src and session.last_reply_vip and self.V2R_Mappings.get(session.last_reply_vip) == server_real:
+                vip_src = session.last_reply_vip
+
+            if not vip_src:
+                pool = self.host_vip_pools.get(server_real, set())
+                for candidate in sorted(pool):
+                    if self.V2R_Mappings.get(candidate) == server_real:
+                        vip_src = candidate
+                        break
+
             if vip_src:
-                session.vip_locked = vip_src
+                previous_reply_vip = session.last_reply_vip
+                freed_prev = False
+                if previous_reply_vip and previous_reply_vip != vip_src:
+                    freed_prev = self._detach_session_from_vip(previous_reply_vip, session_key)
+                    self._mark_vip_reuse(previous_reply_vip, now)
+                    if freed_prev:
+                        self._flag_vip_idle(previous_reply_vip, now, "reply vip rotation")
+                if proto != 1:
+                    session.vip_locked = vip_src
                 self._touch_vip(vip_src, now, "reply packet")
                 mac = self.vip_mac_map.get(vip_src) or self._generate_vip_mac(vip_src)
                 self.vip_mac_map[vip_src] = mac
                 actions.append(parser.OFPActionSetField(ipv4_src=vip_src))
                 actions.append(parser.OFPActionSetField(eth_src=mac))
                 self.vip_active_sessions.setdefault(vip_src, set()).add(session_key)
+                session.last_reply_vip = vip_src
+                self._mark_vip_reuse(vip_src, now)
+                key = self._compose_reply_key(server_real, client_real, proto,
+                                               client_port, server_port)
+                previous = self._reply_vip_by_5tuple.get(key)
+                if previous != vip_src:
+                    self._reply_vip_by_5tuple[key] = vip_src
+                    session.reply_keys.add(key)
+                    self.reply_vip_pair[(server_real, client_real, proto)] = vip_src
+                    if proto == 1:
+                        self.logger.info("REPLY OVERRIDE (ICMP): Using %s for %s->%s (client=%s)",
+                                         vip_src, server_real, client_real, client_real)
+                    else:
+                        self.logger.info("REPLY OVERRIDE: Using %s for %s->%s proto=%d",
+                                         vip_src, server_real, client_real, proto)
+                self._send_targeted_arp_to_host_for_vip(vip_src, client_real)
             client_mac = self.host_ip_to_mac.get(client_real)
             if client_mac:
                 actions.append(parser.OFPActionSetField(eth_dst=client_mac))
@@ -470,7 +600,7 @@ class MovingTargetDefense(app_manager.RyuApp):
         else:
             if forward_dst_mac:
                 out_port = self.mac_to_port.get(dpid, {}).get(forward_dst_mac, ofp.OFPP_FLOOD)
-        actions.append(parser.OFPActionOutput(out_port))
+            actions.append(parser.OFPActionOutput(out_port))
 
         if msg.buffer_id == ofp.OFP_NO_BUFFER:
             data = msg.data
@@ -486,31 +616,25 @@ class MovingTargetDefense(app_manager.RyuApp):
 
         if new_session:
             self.logger.info("SESSION: created %s -> %s (proto %d) vip_dst=%s (key=%s)",
-                         src_ip, dst_ip, proto, session.vip_dst, session_key)
+                             src_ip, dst_ip, proto, session.vip_dst, (src_ip, dst_ip))
 
         session.packet_count += 1
+        session.last_growth = now
         if session.vip_src:
             self._touch_vip(session.vip_src, now, "packet activity: vip_src")
         if session.vip_locked:
             self._touch_vip(session.vip_locked, now, "packet activity: vip_locked")
         elif session.vip_dst:
             self._touch_vip(session.vip_dst, now, "packet activity: vip_dst")
-        # self.logger.info("DEBUG: Session found/created for %s->%s, vip_dst=%s",
-        #                  src_ip, dst_ip, session.vip_dst)
+        self.logger.info("DEBUG: Session found/created for %s->%s, vip_dst=%s",
+                         src_ip, dst_ip, session.vip_dst)
 
     def _classify_flow(self, src_ip: str, dst_ip: str, proto: int,
                        src_port: int, dst_port: int):
         src_real = self.V2R_Mappings.get(src_ip, src_ip)
         dst_real = self.V2R_Mappings.get(dst_ip, dst_ip)
-        
-        # For ICMP, use original IPs in session key to distinguish between different VIPs
-        if proto == 1:  # ICMP
-            forward_key = (src_ip, dst_ip, proto, src_port, dst_port)
-            reverse_key = (dst_ip, src_ip, proto, dst_port, src_port)
-        else:
-            forward_key = (src_real, dst_real, proto, src_port, dst_port)
-            reverse_key = (dst_real, src_real, proto, dst_port, src_port)
-            
+        forward_key = (src_real, dst_real, proto, src_port, dst_port)
+        reverse_key = (dst_real, src_real, proto, dst_port, src_port)
         if reverse_key in self.session_table:
             client_real = dst_real
             server_real = src_real
@@ -537,46 +661,34 @@ class MovingTargetDefense(app_manager.RyuApp):
         dst_ip = session.dst_ip_initial or session.key[1]
         self.logger.info("SESSION: removed %s -> %s", src_ip, dst_ip)
 
-        # For ICMP, keep reply mappings persistent to avoid ping failures
-        if session.proto != 1:  # Not ICMP
-            for key in session.reply_keys:
-                self._reply_vip_by_5tuple.pop(key, None)
-            pair_key = (session.key[1], session.key[0], session.proto)
-            if self.reply_vip_pair.get(pair_key) == session.vip_locked:
-                self.reply_vip_pair.pop(pair_key, None)
+        for key in session.reply_keys:
+            self._reply_vip_by_5tuple.pop(key, None)
+        pair_key = (session.key[1], session.key[0], session.proto)
+        if self.reply_vip_pair.get(pair_key) == session.vip_locked:
+            self.reply_vip_pair.pop(pair_key, None)
 
-        for vip in {session.vip_src, session.vip_locked, session.vip_dst}:
+        for vip in {session.vip_src, session.vip_locked, session.vip_dst, session.last_reply_vip}:
             if not vip:
                 continue
-            active = self.vip_active_sessions.get(vip)
-            if active:
-                active.discard(session_key)
-                if not active:
-                    self.vip_active_sessions.pop(vip, None)
-                    # For ICMP, don't start idle timer immediately - keep VIP available
-                    if session.proto != 1:
-                        self._start_idle_timer(vip, ts, reason)
-            else:
-                # For ICMP, don't start idle timer immediately - keep VIP available
-                if session.proto != 1:
-                    self._start_idle_timer(vip, ts, reason)
+            released = self._detach_session_from_vip(vip, session_key)
+            if released:
+                self._flag_vip_idle(vip, ts, reason)
             self._mark_vip_reuse(vip, ts)
+
+        flow_key = (session.key[0], session.key[1], session.proto, session.key[3], session.key[4])
+        reverse_key = (session.key[1], session.key[0], session.proto, session.key[4], session.key[3])
+        self.session_last_contacted_vip.pop(flow_key, None)
+        self.session_last_contacted_vip.pop(reverse_key, None)
 
     def _choose_outbound_vip(self, real_ip: str, now: float) -> Optional[str]:
         pool = self.host_vip_pools.get(real_ip, set())
         if not pool:
             return None
-        icmp_vips: List[str] = []
         primary: List[str] = []
         cooling: List[str] = []
         fallback: List[str] = []
         for vip in pool:
             fallback.append(vip)
-            # Prefer VIPs that have ICMP reply mappings (more likely to work)
-            has_icmp_mapping = any(v == vip for v in self._reply_vip_by_5tuple.values()) or \
-                              any(v == vip for v in self.reply_vip_pair.values())
-            if has_icmp_mapping:
-                icmp_vips.append(vip)
             if self.vip_active_sessions.get(vip):
                 continue
             last_used = self.vip_recently_used.get(vip, 0.0)
@@ -584,16 +696,23 @@ class MovingTargetDefense(app_manager.RyuApp):
                 cooling.append(vip)
                 continue
             primary.append(vip)
-        # Prefer ICMP VIPs first, then primary, then cooling, then fallback
-        if icmp_vips:
-            return random.choice(icmp_vips)
         if primary:
             return random.choice(primary)
         if cooling:
             return random.choice(cooling)
         if fallback:
             return random.choice(fallback)
-            return None
+        return None
+
+    def _compose_reply_key(self, server_real: str, client_real: str,
+                           proto: int, client_port: int, server_port: int) -> Tuple[str, str, int, int, int]:
+        if proto == 1:
+            return (server_real, client_real, 1, 0, 0)
+        if proto == 6:
+            return (server_real, client_real, 6, client_port, server_port)
+        if proto == 17:
+            return (server_real, client_real, 17, client_port, server_port)
+        return (server_real, client_real, proto, client_port, server_port)
 
     def _register_reply_mapping(self, session: SessionRecord, server_real: str,
                                 client_real: str, proto: int, vip_dst: str,
@@ -617,21 +736,12 @@ class MovingTargetDefense(app_manager.RyuApp):
             return
 
         self.reply_vip_pair[(server_real, client_real, proto)] = vip_dst
-        if proto == 1:
-            key = (server_real, client_real, 1, 0, 0)
-        elif proto == 6:
-            key = (server_real, client_real, 6, client_port, server_port)
-        elif proto == 17:
-            key = (server_real, client_real, 17, client_port, server_port)
-        else:
-            key = (server_real, client_real, proto, client_port, server_port)
+        key = self._compose_reply_key(server_real, client_real, proto,
+                                      client_port, server_port)
         self._reply_vip_by_5tuple[key] = vip_dst
         session.reply_keys.add(key)
         self.logger.info("REPLY MAPPING: server=%s client=%s proto=%d uses VIP %s (5tuple key=%s)",
                          server_real, client_real, proto, vip_dst, key)
-        # Force-lock ICMP replies to the contacted VIP
-        if proto == 1 and session is not None:
-            session.vip_locked = vip_dst
 
     # ---------------- VIP helpers ----------------
     def _allocate_vip_to_host(self, real_ip: str, now: float, announce: bool = True) -> Optional[str]:
@@ -729,32 +839,24 @@ class MovingTargetDefense(app_manager.RyuApp):
             self.vip_mac_map[vip] = mac
             host_mac = self.host_ip_to_mac.get(target_real_ip)
             if not host_mac:
-                self.logger.warning("ARP: JIT failed - no MAC for host %s", target_real_ip)
                 return
-            
-            # Send multiple times with small delays to ensure delivery
-            for attempt in range(3):
-                for dp in list(self.datapaths):
-                    parser = dp.ofproto_parser
-                    ofp = dp.ofproto
-                    out_port = self.mac_to_port.get(dp.id, {}).get(host_mac, ofp.OFPP_FLOOD)
-                    p = packet.Packet()
-                    p.add_protocol(ethernet.ethernet(ethertype=0x0806, dst=host_mac, src=mac))
-                    p.add_protocol(arp.arp(opcode=arp.ARP_REPLY,
-                                           src_mac=mac, src_ip=vip,
-                                           dst_mac=host_mac, dst_ip=target_real_ip))
-                    p.serialize()
-                    dp.send_msg(parser.OFPPacketOut(
-                        datapath=dp,
-                        buffer_id=ofp.OFP_NO_BUFFER,
-                        in_port=ofp.OFPP_CONTROLLER,
-                        actions=[parser.OFPActionOutput(out_port)],
-                        data=p.data))
-                if attempt < 2:
-                    hub.sleep(0.05)  # 50ms delay between attempts
-            
-            self.logger.info("ARP: targeted JIT for SNAT VIP %s -> host %s (MAC: %s, 3 attempts)", 
-                           vip, target_real_ip, host_mac)
+            for dp in list(self.datapaths):
+                parser = dp.ofproto_parser
+                ofp = dp.ofproto
+                out_port = self.mac_to_port.get(dp.id, {}).get(host_mac, ofp.OFPP_FLOOD)
+                p = packet.Packet()
+                p.add_protocol(ethernet.ethernet(ethertype=0x0806, dst=host_mac, src=mac))
+                p.add_protocol(arp.arp(opcode=arp.ARP_REPLY,
+                                       src_mac=mac, src_ip=vip,
+                                       dst_mac=host_mac, dst_ip=target_real_ip))
+                p.serialize()
+                dp.send_msg(parser.OFPPacketOut(
+                    datapath=dp,
+                    buffer_id=ofp.OFP_NO_BUFFER,
+                    in_port=ofp.OFPP_CONTROLLER,
+                    actions=[parser.OFPActionOutput(out_port)],
+                    data=p.data))
+            self.logger.info("ARP: targeted JIT for SNAT VIP %s -> host %s", vip, target_real_ip)
         except Exception as e:
             self.logger.warning("ARP: targeted JIT failed for %s->%s: %s", vip, target_real_ip, e)
 
@@ -778,6 +880,9 @@ class MovingTargetDefense(app_manager.RyuApp):
         for k, v in list(self.reply_vip_pair.items()):
             if v == vip:
                 self.reply_vip_pair.pop(k, None)
+        for key, value in list(self.session_last_contacted_vip.items()):
+            if value == vip:
+                self.session_last_contacted_vip.pop(key, None)
         for session_key, session in list(self.session_table.items()):
             if session.vip_dst == vip or session.vip_src == vip or session.vip_locked == vip:
                 self._finalize_session(session_key, time(), reason="vip reclaim")
@@ -836,7 +941,8 @@ class MovingTargetDefense(app_manager.RyuApp):
                     break
                 self._bind_vip_to_host(vip, real_ip, now)
                 assigned.append(vip)
-        self.logger.info("[+] New host %s (%s) - assigned %d VIPs", real_ip, mac, len(assigned))
+        self.logger.info("[+] New host %s (%s) - assigned %d VIPs: %s",
+                         real_ip, mac, len(assigned), sorted(self.host_vip_pools[real_ip]))
         for vip in assigned:
             self._send_gratuitous_arp_to_all(vip)
             self._send_targeted_arp_updates(vip)
@@ -890,22 +996,19 @@ class MovingTargetDefense(app_manager.RyuApp):
                     self.logger.debug("Discovery ARP to %s failed: %s", ip, e)
 
     # ---------------- selection helpers ----------------
-    def _select_reply_vip_5tuple(self, server_real, client_real, proto, sport, dport):
-        if proto in (6, 17):
-            key = (server_real, client_real, proto, dport, sport)
-            vip = self._reply_vip_by_5tuple.get(key)
-            if vip and self.V2R_Mappings.get(vip) == server_real:
-                return vip
-        elif proto == 1:
-            key = (server_real, client_real, 1, 0, 0)
-            vip = self._reply_vip_by_5tuple.get(key)
-            if vip and self.V2R_Mappings.get(vip) == server_real:
-                return vip
+    def _select_reply_vip_5tuple(self, server_real, client_real, proto, client_port, server_port):
+        key = self._compose_reply_key(server_real, client_real, proto,
+                                      client_port, server_port)
+        vip = self._reply_vip_by_5tuple.get(key)
+        if vip and self.V2R_Mappings.get(vip) == server_real:
+            return vip
         return None
 
     # ---------------- logging ----------------
     def _log_vip_pools(self, now: float) -> None:
         self.logger.info("=== VIP POOLS ===")
+        self.logger.info("DEBUG - V2R Mappings: %s", self.V2R_Mappings)
+        self.logger.info("DEBUG - VIP last_seen: %s", self.vip_last_seen)
 
         def ipkey(ip):
             try:
@@ -918,7 +1021,7 @@ class MovingTargetDefense(app_manager.RyuApp):
         for real_ip in sorted(self.detected_hosts, key=ipkey):
             pool = self.host_vip_pools.get(real_ip, set())
             if not pool:
-                # Host has no VIPs assigned
+                self.logger.info("Host %s: No VIPs assigned", real_ip)
                 continue
             self.logger.info("Host %s (%d VIPs):", real_ip, len(pool))
             self.logger.info(" %-13s %-9s %-8s %-10s %-12s", "VIP", "Uptime", "State", "Idle", "Reclaim")
