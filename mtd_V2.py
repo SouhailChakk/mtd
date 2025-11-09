@@ -882,28 +882,56 @@ class MovingTargetDefense(app_manager.RyuApp):
         return vip
 
     def _purge_flows_for_vip(self, vip: str) -> None:
+        mac = self.vip_mac_map.get(vip)
+        if not mac:
+            mac = self._generate_vip_mac(vip)
+            # do not persist the MAC here; callers will record authoritative
+            # bindings during assignment/announcement.
+
+        flow_matches = [
+            {"eth_type": 0x0800, "ipv4_dst": vip},
+            {"eth_type": 0x0800, "ipv4_src": vip},
+        ]
+
+        # Some switches learn MAC based forwarding rules from earlier traffic.
+        # When a VIP is rebound we must tear down those flows as well or packets
+        # may continue to follow the stale output port until the rule times out.
+        if mac:
+            flow_matches.extend([
+                {"eth_dst": mac},
+                {"eth_src": mac},
+            ])
+
         for dp in list(self.datapaths):
             parser = dp.ofproto_parser
             ofp = dp.ofproto
-            mod_dst = parser.OFPFlowMod(
-                datapath=dp,
-                table_id=ofp.OFPTT_ALL,
-                command=ofp.OFPFC_DELETE,
-                out_port=ofp.OFPP_ANY,
-                out_group=ofp.OFPG_ANY,
-                match=parser.OFPMatch(eth_type=0x0800, ipv4_dst=vip)
-            )
-            dp.send_msg(mod_dst)
-            mod_src = parser.OFPFlowMod(
-                datapath=dp,
-                table_id=ofp.OFPTT_ALL,
-                command=ofp.OFPFC_DELETE,
-                out_port=ofp.OFPP_ANY,
-                out_group=ofp.OFPG_ANY,
-                match=parser.OFPMatch(eth_type=0x0800, ipv4_src=vip)
-            )
-            dp.send_msg(mod_src)
-        self.logger.info("FLOW: purged flows for VIP %s (src & dst matches)", vip)
+            for match_kwargs in flow_matches:
+                match = parser.OFPMatch(**match_kwargs)
+                mod = parser.OFPFlowMod(
+                    datapath=dp,
+                    table_id=ofp.OFPTT_ALL,
+                    command=ofp.OFPFC_DELETE,
+                    out_port=ofp.OFPP_ANY,
+                    out_group=ofp.OFPG_ANY,
+                    match=match,
+                )
+                dp.send_msg(mod)
+
+            # Ensure the controller receives notification once the deletions are
+            # processed so newly arriving packets hit the table-miss path
+            # immediately instead of waiting for idle timers.
+            try:
+                barrier = parser.OFPBarrierRequest(dp)
+                dp.send_msg(barrier)
+            except Exception:
+                # Barrier support is optional; fall back silently if the switch
+                # rejects the request.  A warning would be too noisy here.
+                pass
+
+        self.logger.info(
+            "FLOW: purged flows for VIP %s (IP & MAC matches removed)",
+            vip,
+        )
 
     def _send_gratuitous_arp_to_all(self, vip: str) -> None:
         if not self.datapaths:
