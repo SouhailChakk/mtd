@@ -64,7 +64,7 @@ class MovingTargetDefense(app_manager.RyuApp):
 
     # ===================== CONFIG =====================
     NUM_VIPS = 244                   # VIP pool size (addresses from 10.0.0.11-10.0.0.254)
-    VIP_ROTATION_INTERVAL = 60       # rotate primary VIP after this many seconds of activity
+    VIP_ROTATION_INTERVAL = 30       # rotate primary VIP after this many seconds of activity
     SESSION_NO_GROWTH_TIMEOUT = 5   # session "quiet" threshold (s)
     HOUSEKEEPING_INTERVAL = 15        # periodic tick (s)
     DISCOVERY_RANGE_LAST_OCTET_MAX = 10   # discover 10.0.0.1..10.0.0.10
@@ -1555,4 +1555,3 @@ class MovingTargetDefense(app_manager.RyuApp):
             self.logger.info(" → %d active, %d idle", host_active, len(pool) - host_active)
         self.logger.info("=== SUMMARY: %d total VIPs (%d active, %d idle) ===",
                          total, active_total, total - active_total)
-
