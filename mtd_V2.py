@@ -361,11 +361,14 @@ class MovingTargetDefense(app_manager.RyuApp):
                     # Old primary is demoted from primary but keeps its sessions
                     # Sessions remain in vip_active_sessions[old_primary]
                     # New sessions will use new_primary
-                    # CRITICAL: Immediately send additional ARP updates to ensure all hosts know about new VIP
-                    # This prevents ARP cache misses and ping delays during rotation
-                    # (announce=True already sends ARP, but we send again to ensure immediate propagation)
-                    self._send_gratuitous_arp_to_all(new_primary)
-                    self._send_targeted_arp_updates(new_primary)
+                    # CRITICAL: Send ARP updates asynchronously to avoid blocking packet processing
+                    # Use hub.spawn to send ARP in background - this prevents ping drops during rotation
+                    def _async_arp_announce():
+                        for _ in range(3):  # Send 3 times to ensure all hosts update their ARP cache
+                            self._send_gratuitous_arp_to_all(new_primary)
+                            self._send_targeted_arp_updates(new_primary)
+                            hub.sleep(0.05)  # Small delay between sends
+                    hub.spawn(_async_arp_announce)
                     self.logger.info("ROTATE: host %s new primary=%s (old=%s keeps %d sessions until they end)",
                                      real_ip, new_primary, old_primary, 
                                      len(self.vip_active_sessions.get(old_primary, set())))
@@ -383,12 +386,13 @@ class MovingTargetDefense(app_manager.RyuApp):
                     self.host_primary_active_since.pop(real_ip, None)
                     self.host_primary_ever_active[real_ip] = False  # Reset for new primary
                     self.host_primary_last_activity[real_ip] = now
-                    # CRITICAL: Immediately send ARP updates MULTIPLE times to ensure all hosts know about new VIP
-                    # This is especially important when VIP is immediately reassigned after reclaim
-                    # Send ARP aggressively to prevent ARP cache misses and ping delays
-                    for _ in range(2):  # Send twice to ensure propagation
-                        self._send_gratuitous_arp_to_all(new_primary)
-                        self._send_targeted_arp_updates(new_primary)
+                    # CRITICAL: Send ARP updates asynchronously to avoid blocking packet processing
+                    def _async_arp_announce():
+                        for _ in range(3):  # Send 3 times to ensure propagation
+                            self._send_gratuitous_arp_to_all(new_primary)
+                            self._send_targeted_arp_updates(new_primary)
+                            hub.sleep(0.05)  # Small delay between sends
+                    hub.spawn(_async_arp_announce)
                     return
         else:
             # Still within 60s grace period - don't check anything, just wait
@@ -447,8 +451,14 @@ class MovingTargetDefense(app_manager.RyuApp):
         # If VIP exists in V2R_Mappings, it means it's being reassigned without reclaim
         old_owner = self.V2R_Mappings.get(vip)
         if old_owner and old_owner != real_ip:
-            # VIP is being reassigned to a different host - purge old flows
-            self._purge_flows_for_vip(vip)
+            # VIP is being reassigned to a different host - check if old owner still has active sessions
+            # CRITICAL: Only purge flows if the old owner has no active sessions for this VIP
+            # This prevents flow deletion during rotation when old primary VIP still has active sessions
+            old_owner_sessions = self.vip_active_sessions.get(vip)
+            if not old_owner_sessions:
+                # No active sessions - safe to purge flows
+                self._purge_flows_for_vip(vip)
+            # If there are active sessions, don't purge flows - they're still needed
         # Note: If VIP was reclaimed, flows were already purged in _reclaim_vip
         # But we still need to ensure flows are clean for immediate reassignment
         
@@ -713,7 +723,7 @@ class MovingTargetDefense(app_manager.RyuApp):
                         self.host_vip_pools.setdefault(target, set()).add(dip)
                         self.vip_created_at[dip] = now
                         self.vip_mac_map[dip] = self._generate_vip_mac(dip)
-                        self._purge_flows_for_vip(dip, include_mac=False)
+                        self._purge_flows_for_vip(dip)
                         self._send_gratuitous_arp_to_all(dip)
                         self._send_targeted_arp_updates(dip)
                         self.logger.info("LAZY-ASSIGN: VIP %s -> %s on ARP from %s", dip, target, sip)
@@ -772,26 +782,32 @@ class MovingTargetDefense(app_manager.RyuApp):
 
         # NEW LOGIC: For forward direction, use existing VIP or primary VIP of destination
         if direction == 'forward':
-            # CRITICAL: If dst_ip is already a VIP, use that VIP directly (user explicitly pinged it)
-            # This ensures that when you ping a specific VIP, that VIP is used for the session
+            # CRITICAL: If dst_ip is explicitly a VIP, ALWAYS use that VIP (user explicitly pinged it)
+            # This overrides any existing session VIP to ensure explicit VIP pings work correctly
             if dst_ip in self.V2R_Mappings and self.V2R_Mappings.get(dst_ip) == server_real:
-                # User explicitly pinged this VIP - use it
+                # User explicitly pinged this VIP - ALWAYS use it, even if session has different VIP
                 vip_dst = dst_ip
-                # Ensure this VIP is in the session
-                if not session.vip_dst or session.vip_dst != vip_dst:
-                    session.vip_dst = vip_dst
-            elif session.vip_dst and self.V2R_Mappings.get(session.vip_dst) == server_real:
-                # Session already has a VIP assigned - use it (preserves old primary VIP sessions)
-                vip_dst = session.vip_dst
+                # Force update session.vip_dst to this VIP
+                session.vip_dst = vip_dst
+                # Also update session_last_contacted_vip to ensure reverse direction uses correct VIP
+                flow_key = (client_real, server_real, proto, client_port, server_port)
+                self.session_last_contacted_vip[flow_key] = vip_dst
             else:
-                # New session or VIP no longer valid - use current primary VIP
+                # User is pinging REAL IP (not a VIP) - always use current primary VIP
+                # CRITICAL: For new sessions or stale sessions, always get fresh primary VIP
+                # Check if session is stale (no growth for >2s) - if so, force new primary lookup
                 primary_dst_vip = self._ensure_primary_vip(server_real, now, force=True)
-                if primary_dst_vip:
+                if new_session or (now - session.last_growth) > 2.0:
+                    # New or stale session - ensure we get the absolute latest primary VIP
                     vip_dst = primary_dst_vip
-                    # For new sessions, immediately send ARP update to client to prevent delays
-                    # This is especially important for ICMP ping continuity during rotation
-                    if new_session:
-                        self._send_targeted_arp_to_host_for_vip(vip_dst, client_real)
+                else:
+                    # Active session - use existing VIP if valid, otherwise get primary
+                    if session.vip_dst and self.V2R_Mappings.get(session.vip_dst) == server_real:
+                        # Existing VIP is still valid - use it
+                        vip_dst = session.vip_dst
+                    else:
+                        # Existing VIP is invalid - get current primary
+                        vip_dst = primary_dst_vip
             
             if vip_dst:
                 real_dst = server_real
@@ -849,7 +865,10 @@ class MovingTargetDefense(app_manager.RyuApp):
                     session.last_vip_src_announce = 0.0
                 self._activate_vip_for_session(vip_src, session_key, now)
                 self._touch_vip(vip_src, now, "session create: vip_src")
-                if new_session or (now - session.last_vip_src_announce) >= self.SESSION_NO_GROWTH_TIMEOUT:
+                # CRITICAL: Only send ARP JIT for NEW sessions or when VIP changes
+                # This prevents ARP spam - existing sessions don't need constant ARP updates
+                if new_session or (session.last_vip_src_announce == 0.0) or (vip_src != session.vip_src):
+                    # Only send ARP if this is a new session, first time, or VIP changed
                     self._send_targeted_arp_to_host_for_vip(vip_src, server_real)
                     session.last_vip_src_announce = now
                 self._evaluate_host_state(client_real, now)
@@ -883,69 +902,44 @@ class MovingTargetDefense(app_manager.RyuApp):
 
             # NEW LOGIC: Prefer the primary VIP for replies (if it matches the session)
             primary_reply_vip = self.host_primary_vip.get(server_real)
-            # CRITICAL: If session.vip_dst is set (from forward direction), use it for replies
-            # This ensures that when you ping a specific VIP, replies come from that same VIP
+            
+            # CRITICAL: For reverse direction, ALWAYS prioritize session.vip_dst first
+            # This ensures that when forward direction sets a VIP, reverse uses the same VIP
+            # This is especially important for new sessions after primary VIP rotation
             if session.vip_dst and self.V2R_Mappings.get(session.vip_dst) == server_real:
-                # Session has a specific VIP assigned - use it for replies
-                # This handles both: explicit VIP pings and new primary VIP sessions
+                # Session has VIP from forward direction - use it (highest priority)
                 vip_src = session.vip_dst
+            elif proto == 1:
+                # ICMP: Use echo map (from forward direction), then primary VIP, then others
+                preferred_vips: List[Optional[str]] = [icmp_bound_vip, primary_reply_vip, mapping_vip, session.last_reply_vip]
+                for candidate in preferred_vips:
+                    if candidate and self.V2R_Mappings.get(candidate) == server_real:
+                        vip_src = candidate
+                        break
             else:
-                # No specific VIP in session - use established mappings
-                # Check if this session is using the current primary VIP
-                session_uses_current_primary = (session.vip_dst == primary_reply_vip)
-                
-                if proto == 1:
-                    # ICMP: If session uses current primary, prioritize primary VIP first
-                    # Otherwise, use echo map (which should have the correct VIP from forward direction)
-                    if session_uses_current_primary:
-                        # New session using new primary: prioritize primary VIP
-                        preferred_vips: List[Optional[str]] = [primary_reply_vip, icmp_bound_vip, mapping_vip, session.last_reply_vip]
-                    else:
-                        # Old session using old primary: use echo map first (preserves old primary)
-                        preferred_vips: List[Optional[str]] = [icmp_bound_vip, mapping_vip, primary_reply_vip, session.last_reply_vip]
-                    for candidate in preferred_vips:
-                        if candidate and self.V2R_Mappings.get(candidate) == server_real:
-                            vip_src = candidate
-                            break
-                else:
-                    # Non-ICMP: If session uses current primary, prioritize primary VIP first
-                    if session_uses_current_primary:
-                        # New session using new primary: prioritize primary VIP
-                        ordered: List[Optional[str]] = [primary_reply_vip, session.vip_locked, mapping_vip,
-                                                        contacted_vip, session.last_reply_vip]
-                    else:
-                        # Old session using old primary: use established mappings
-                        ordered: List[Optional[str]] = [session.vip_locked, mapping_vip, primary_reply_vip,
-                                                        contacted_vip, session.last_reply_vip]
-                    for candidate in ordered:
-                        if candidate and self.V2R_Mappings.get(candidate) == server_real:
-                            vip_src = candidate
-                            break
+                # Non-ICMP: Use session locked, then primary VIP, then others
+                ordered: List[Optional[str]] = [session.vip_locked, primary_reply_vip, mapping_vip,
+                                                contacted_vip, session.last_reply_vip]
+                for candidate in ordered:
+                    if candidate and self.V2R_Mappings.get(candidate) == server_real:
+                        vip_src = candidate
+                        break
 
-            def _consider(candidate: Optional[str]) -> None:
-                if not candidate:
-                    return
-                if candidate in preferred_vips:
-                    return
-                if self.V2R_Mappings.get(candidate) != server_real:
-                    return
-                preferred_vips.append(candidate)
+            if vip_src and self.V2R_Mappings.get(vip_src) != server_real:
+                vip_src = None
 
-            _consider(session.vip_dst)
+            # Final fallback to session.vip_dst if nothing else worked
+            if not vip_src and session.vip_dst and self.V2R_Mappings.get(session.vip_dst) == server_real:
+                vip_src = session.vip_dst
 
-            if proto == 1:
-                _consider(icmp_bound_vip)
-                _consider(mapping_vip)
-                _consider(session.last_reply_vip)
-            else:
-                _consider(session.vip_locked)
-                _consider(mapping_vip)
-                _consider(contacted_vip)
-                _consider(session.last_reply_vip)
+            if not vip_src and mapping_vip and self.V2R_Mappings.get(mapping_vip) == server_real:
+                vip_src = mapping_vip
 
-            for candidate in preferred_vips:
-                vip_src = candidate
-                break
+            if not vip_src and contacted_vip and self.V2R_Mappings.get(contacted_vip) == server_real:
+                vip_src = contacted_vip
+
+            if not vip_src and session.last_reply_vip and self.V2R_Mappings.get(session.last_reply_vip) == server_real:
+                vip_src = session.last_reply_vip
 
             if not vip_src:
                 # Fallback to primary VIP
@@ -981,7 +975,10 @@ class MovingTargetDefense(app_manager.RyuApp):
                     else:
                         self.logger.info("REPLY OVERRIDE: Using %s for %s->%s proto=%d",
                                          vip_src, server_real, client_real, proto)
-                self._send_targeted_arp_to_host_for_vip(vip_src, client_real)
+                # CRITICAL: Only send ARP JIT for NEW sessions or when VIP changes
+                # This prevents ARP spam in reverse direction too
+                if new_session or (session.last_reply_vip != vip_src):
+                    self._send_targeted_arp_to_host_for_vip(vip_src, client_real)
             client_mac = self.host_ip_to_mac.get(client_real)
             if client_mac:
                 actions.append(parser.OFPActionSetField(eth_dst=client_mac))
@@ -1033,7 +1030,18 @@ class MovingTargetDefense(app_manager.RyuApp):
         dst_real = self.V2R_Mappings.get(dst_ip, dst_ip)
         forward_key = (src_real, dst_real, proto, src_port, dst_port)
         reverse_key = (dst_real, src_real, proto, dst_port, src_port)
+        
+        # CRITICAL: Check if reverse session exists AND is still active
+        # If session exists but hasn't grown recently, treat as new forward flow
+        # This prevents stale sessions from interfering with new pings after rotation
         if reverse_key in self.session_table:
+            reverse_session = self.session_table[reverse_key]
+            now = time()
+            # If session is stale (no growth for >2 seconds), treat as new forward flow
+            # This ensures new pings after rotation use new primary VIP
+            if (now - reverse_session.last_growth) > 2.0:
+                # Stale session - treat as new forward flow
+                return 'forward', forward_key, src_real, dst_real, src_port, dst_port
             client_real = dst_real
             server_real = src_real
             client_port = dst_port
@@ -1161,108 +1169,29 @@ class MovingTargetDefense(app_manager.RyuApp):
         self.logger.info("ALLOC: on-demand VIP %s -> %s", vip, real_ip)
         return vip
 
-    def _purge_flows_for_vip(self, vip: str, *, include_mac: bool = True) -> None:
-        mac = self.vip_mac_map.get(vip)
-        if not mac:
-            mac = self._generate_vip_mac(vip)
-            # do not persist the MAC here; callers will record authoritative
-            # bindings during assignment/announcement.
-
-        flow_matches = [
-            {"eth_type": 0x0800, "ipv4_dst": vip},
-            {"eth_type": 0x0800, "ipv4_src": vip},
-        ]
-
-        # Some switches learn MAC based forwarding rules from earlier traffic.
-        # When a VIP is rebound we must tear down those flows as well or packets
-        # may continue to follow the stale output port until the rule times out.
-        if include_mac and mac:
-            flow_matches.extend([
-                {"eth_type": 0x0800, "eth_dst": mac},
-                {"eth_type": 0x0800, "eth_src": mac},
-                {"eth_type": 0x0806, "eth_dst": mac},
-                {"eth_type": 0x0806, "eth_src": mac},
-            ])
-
+    def _purge_flows_for_vip(self, vip: str) -> None:
         for dp in list(self.datapaths):
             parser = dp.ofproto_parser
             ofp = dp.ofproto
-            for match_kwargs in flow_matches:
-                match = parser.OFPMatch(**match_kwargs)
-                mod = parser.OFPFlowMod(
-                    datapath=dp,
-                    table_id=ofp.OFPTT_ALL,
-                    command=ofp.OFPFC_DELETE,
-                    out_port=ofp.OFPP_ANY,
-                    out_group=ofp.OFPG_ANY,
-                    match=match,
-                )
-                dp.send_msg(mod)
-
-            # Ensure the controller receives notification once the deletions are
-            # processed so newly arriving packets hit the table-miss path
-            # immediately instead of waiting for idle timers.
-            try:
-                barrier = parser.OFPBarrierRequest(dp)
-                dp.send_msg(barrier)
-            except Exception:
-                # Barrier support is optional; fall back silently if the switch
-                # rejects the request.  A warning would be too noisy here.
-                pass
-
-        if include_mac and mac:
-            detail = "IP & MAC matches removed"
-        else:
-            detail = "IP matches removed"
-
-        self.logger.info("FLOW: purged flows for VIP %s (%s)", vip, detail)
-
-    def _schedule_vip_flow_refresh(self, vip: str, owner: str, *, include_mac: bool) -> None:
-        has_active = bool(self.vip_active_sessions.get(vip))
-        if include_mac or has_active:
-            try:
-                hub.spawn(self._async_vip_flow_refresh, vip, owner, include_mac, has_active)
-                return
-            except Exception as e:
-                self.logger.warning("FLOW: async scheduling failed for VIP %s: %s", vip, e)
-        self._purge_flows_for_vip(vip, include_mac=include_mac)
-
-    def _async_vip_flow_refresh(self, vip: str, owner: str, include_mac: bool, has_active: bool) -> None:
-        try:
-            peers: Set[str] = set()
-            active_keys = list(self.vip_active_sessions.get(vip, set()))
-            for session_key in active_keys:
-                session = self.session_table.get(session_key)
-                if not session:
-                    continue
-                client_real, server_real, _proto, _cport, _sport = session.key
-                if session.vip_dst == vip:
-                    peers.add(client_real)
-                if (session.vip_src == vip or
-                        session.vip_locked == vip or
-                        session.last_reply_vip == vip):
-                    peers.add(server_real)
-
-            peers.discard(owner)
-            if peers:
-                self.logger.info("FLOW: priming %d peers for VIP %s handoff", len(peers), vip)
-            for peer in peers:
-                self._send_targeted_arp_to_host_for_vip(vip, peer)
-            self._send_targeted_arp_to_host_for_vip(vip, owner)
-
-            delay_needed = self.VIP_FLOW_REFRESH_DELAY if (include_mac or peers or has_active) else 0.0
-            if delay_needed:
-                hub.sleep(delay_needed)
-
-            self._purge_flows_for_vip(vip, include_mac=include_mac)
-
-            if peers or has_active:
-                now = time()
-                for session_key in active_keys:
-                    if session_key in self.session_table:
-                        self._activate_vip_for_session(vip, session_key, now)
-        except Exception as e:
-            self.logger.warning("FLOW: async purge for VIP %s failed: %s", vip, e)
+            mod_dst = parser.OFPFlowMod(
+                datapath=dp,
+                table_id=ofp.OFPTT_ALL,
+                command=ofp.OFPFC_DELETE,
+                out_port=ofp.OFPP_ANY,
+                out_group=ofp.OFPG_ANY,
+                match=parser.OFPMatch(eth_type=0x0800, ipv4_dst=vip)
+            )
+            dp.send_msg(mod_dst)
+            mod_src = parser.OFPFlowMod(
+                datapath=dp,
+                table_id=ofp.OFPTT_ALL,
+                command=ofp.OFPFC_DELETE,
+                out_port=ofp.OFPP_ANY,
+                out_group=ofp.OFPG_ANY,
+                match=parser.OFPMatch(eth_type=0x0800, ipv4_src=vip)
+            )
+            dp.send_msg(mod_src)
+        self.logger.info("FLOW: purged flows for VIP %s (src & dst matches)", vip)
 
     def _send_gratuitous_arp_to_all(self, vip: str) -> None:
         if not self.datapaths:
