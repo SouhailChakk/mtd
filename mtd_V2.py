@@ -69,6 +69,7 @@ class MovingTargetDefense(app_manager.RyuApp):
 
     ICMP_INSTALL_FLOWS = False
     ICMP_FLOW_IDLE = 5
+    VIP_FLOW_REFRESH_DELAY = 0.1
     # ==================================================
 
     def __init__(self, *args, **kwargs):
@@ -345,13 +346,18 @@ class MovingTargetDefense(app_manager.RyuApp):
             pass
 
     def _bind_vip_to_host(self, vip: str, real_ip: str, now: float, *, make_primary: bool = False) -> None:
+        previous_owner = self.V2R_Mappings.get(vip)
         self.V2R_Mappings[vip] = real_ip
         self.host_vip_pools.setdefault(real_ip, set()).add(vip)
         self.vip_created_at[vip] = now
         self.vip_last_seen[vip] = now
         self.vip_last_activity[vip] = now
         self.vip_mac_map[vip] = self._generate_vip_mac(vip)
-        self._purge_flows_for_vip(vip)
+        self._schedule_vip_flow_refresh(
+            vip,
+            real_ip,
+            include_mac=bool(previous_owner and previous_owner != real_ip),
+        )
         if make_primary or self.host_primary_vip.get(real_ip) is None:
             self.host_primary_vip[real_ip] = vip
             self.host_primary_assigned_at[real_ip] = now
@@ -401,7 +407,7 @@ class MovingTargetDefense(app_manager.RyuApp):
                         self.host_vip_pools.setdefault(target, set()).add(dip)
                         self.vip_created_at[dip] = now
                         self.vip_mac_map[dip] = self._generate_vip_mac(dip)
-                        self._purge_flows_for_vip(dip)
+                        self._purge_flows_for_vip(dip, include_mac=False)
                         self._send_gratuitous_arp_to_all(dip)
                         self._send_targeted_arp_updates(dip)
                         self.logger.info("LAZY-ASSIGN: VIP %s -> %s on ARP from %s", dip, target, sip)
@@ -638,34 +644,23 @@ class MovingTargetDefense(app_manager.RyuApp):
                         if self.V2R_Mappings.get(candidate_vip) == server_real:
                             icmp_bound_vip = candidate_vip
 
-            if proto == 1:
-                preferred_vips: List[Optional[str]] = [icmp_bound_vip, mapping_vip, session.last_reply_vip]
-                for candidate in preferred_vips:
-                    if candidate and self.V2R_Mappings.get(candidate) == server_real:
-                        vip_src = candidate
-                        break
-            else:
-                ordered: List[Optional[str]] = [session.vip_locked, mapping_vip,
-                                                contacted_vip, session.last_reply_vip]
-                for candidate in ordered:
-                    if candidate and self.V2R_Mappings.get(candidate) == server_real:
-                        vip_src = candidate
-                        break
+            def _owns(candidate: Optional[str]) -> bool:
+                return bool(candidate and self.V2R_Mappings.get(candidate) == server_real)
 
-            if vip_src and self.V2R_Mappings.get(vip_src) != server_real:
-                vip_src = None
-
-            if not vip_src and session.vip_dst and self.V2R_Mappings.get(session.vip_dst) == server_real:
+            if _owns(session.vip_dst):
                 vip_src = session.vip_dst
 
-            if not vip_src and mapping_vip and self.V2R_Mappings.get(mapping_vip) == server_real:
-                vip_src = mapping_vip
+            if not vip_src and proto == 1:
+                for candidate in (icmp_bound_vip, mapping_vip, session.last_reply_vip):
+                    if _owns(candidate):
+                        vip_src = candidate
+                        break
 
-            if not vip_src and contacted_vip and self.V2R_Mappings.get(contacted_vip) == server_real:
-                vip_src = contacted_vip
-
-            if not vip_src and session.last_reply_vip and self.V2R_Mappings.get(session.last_reply_vip) == server_real:
-                vip_src = session.last_reply_vip
+            if not vip_src and proto != 1:
+                for candidate in (session.vip_locked, mapping_vip, contacted_vip, session.last_reply_vip):
+                    if _owns(candidate):
+                        vip_src = candidate
+                        break
 
             if not vip_src:
                 pool = self.host_vip_pools.get(server_real, set())
@@ -881,29 +876,108 @@ class MovingTargetDefense(app_manager.RyuApp):
         self.logger.info("ALLOC: on-demand VIP %s -> %s", vip, real_ip)
         return vip
 
-    def _purge_flows_for_vip(self, vip: str) -> None:
+    def _purge_flows_for_vip(self, vip: str, *, include_mac: bool = True) -> None:
+        mac = self.vip_mac_map.get(vip)
+        if not mac:
+            mac = self._generate_vip_mac(vip)
+            # do not persist the MAC here; callers will record authoritative
+            # bindings during assignment/announcement.
+
+        flow_matches = [
+            {"eth_type": 0x0800, "ipv4_dst": vip},
+            {"eth_type": 0x0800, "ipv4_src": vip},
+        ]
+
+        # Some switches learn MAC based forwarding rules from earlier traffic.
+        # When a VIP is rebound we must tear down those flows as well or packets
+        # may continue to follow the stale output port until the rule times out.
+        if include_mac and mac:
+            flow_matches.extend([
+                {"eth_type": 0x0800, "eth_dst": mac},
+                {"eth_type": 0x0800, "eth_src": mac},
+                {"eth_type": 0x0806, "eth_dst": mac},
+                {"eth_type": 0x0806, "eth_src": mac},
+            ])
+
         for dp in list(self.datapaths):
             parser = dp.ofproto_parser
             ofp = dp.ofproto
-            mod_dst = parser.OFPFlowMod(
-                datapath=dp,
-                table_id=ofp.OFPTT_ALL,
-                command=ofp.OFPFC_DELETE,
-                out_port=ofp.OFPP_ANY,
-                out_group=ofp.OFPG_ANY,
-                match=parser.OFPMatch(eth_type=0x0800, ipv4_dst=vip)
-            )
-            dp.send_msg(mod_dst)
-            mod_src = parser.OFPFlowMod(
-                datapath=dp,
-                table_id=ofp.OFPTT_ALL,
-                command=ofp.OFPFC_DELETE,
-                out_port=ofp.OFPP_ANY,
-                out_group=ofp.OFPG_ANY,
-                match=parser.OFPMatch(eth_type=0x0800, ipv4_src=vip)
-            )
-            dp.send_msg(mod_src)
-        self.logger.info("FLOW: purged flows for VIP %s (src & dst matches)", vip)
+            for match_kwargs in flow_matches:
+                match = parser.OFPMatch(**match_kwargs)
+                mod = parser.OFPFlowMod(
+                    datapath=dp,
+                    table_id=ofp.OFPTT_ALL,
+                    command=ofp.OFPFC_DELETE,
+                    out_port=ofp.OFPP_ANY,
+                    out_group=ofp.OFPG_ANY,
+                    match=match,
+                )
+                dp.send_msg(mod)
+
+            # Ensure the controller receives notification once the deletions are
+            # processed so newly arriving packets hit the table-miss path
+            # immediately instead of waiting for idle timers.
+            try:
+                barrier = parser.OFPBarrierRequest(dp)
+                dp.send_msg(barrier)
+            except Exception:
+                # Barrier support is optional; fall back silently if the switch
+                # rejects the request.  A warning would be too noisy here.
+                pass
+
+        if include_mac and mac:
+            detail = "IP & MAC matches removed"
+        else:
+            detail = "IP matches removed"
+
+        self.logger.info("FLOW: purged flows for VIP %s (%s)", vip, detail)
+
+    def _schedule_vip_flow_refresh(self, vip: str, owner: str, *, include_mac: bool) -> None:
+        has_active = bool(self.vip_active_sessions.get(vip))
+        if include_mac or has_active:
+            try:
+                hub.spawn(self._async_vip_flow_refresh, vip, owner, include_mac, has_active)
+                return
+            except Exception as e:
+                self.logger.warning("FLOW: async scheduling failed for VIP %s: %s", vip, e)
+        self._purge_flows_for_vip(vip, include_mac=include_mac)
+
+    def _async_vip_flow_refresh(self, vip: str, owner: str, include_mac: bool, has_active: bool) -> None:
+        try:
+            peers: Set[str] = set()
+            active_keys = list(self.vip_active_sessions.get(vip, set()))
+            for session_key in active_keys:
+                session = self.session_table.get(session_key)
+                if not session:
+                    continue
+                client_real, server_real, _proto, _cport, _sport = session.key
+                if session.vip_dst == vip:
+                    peers.add(client_real)
+                if (session.vip_src == vip or
+                        session.vip_locked == vip or
+                        session.last_reply_vip == vip):
+                    peers.add(server_real)
+
+            peers.discard(owner)
+            if peers:
+                self.logger.info("FLOW: priming %d peers for VIP %s handoff", len(peers), vip)
+            for peer in peers:
+                self._send_targeted_arp_to_host_for_vip(vip, peer)
+            self._send_targeted_arp_to_host_for_vip(vip, owner)
+
+            delay_needed = self.VIP_FLOW_REFRESH_DELAY if (include_mac or peers or has_active) else 0.0
+            if delay_needed:
+                hub.sleep(delay_needed)
+
+            self._purge_flows_for_vip(vip, include_mac=include_mac)
+
+            if peers or has_active:
+                now = time()
+                for session_key in active_keys:
+                    if session_key in self.session_table:
+                        self._activate_vip_for_session(vip, session_key, now)
+        except Exception as e:
+            self.logger.warning("FLOW: async purge for VIP %s failed: %s", vip, e)
 
     def _send_gratuitous_arp_to_all(self, vip: str) -> None:
         if not self.datapaths:
