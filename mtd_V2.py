@@ -50,8 +50,6 @@ class SessionRecord:
     reverse_dst_initial: str = ""
     proto: int = 0
     reply_keys: Set[Tuple] = field(default_factory=set)
-    forward_flow_cookie: Optional[int] = None
-    reverse_flow_cookie: Optional[int] = None
 
 
 class EventMessage(event.EventBase):
@@ -74,12 +72,12 @@ class MovingTargetDefense(app_manager.RyuApp):
 
     INITIAL_ASSIGN_ON_DISCOVERY = True
 
-    ICMP_INSTALL_FLOWS = True
+    ICMP_INSTALL_FLOWS = False
     ICMP_FLOW_IDLE = 5
     
     # DNS config
     DNS_SERVER_PORT = 53
-    DNS_TTL = 300  # 5 minutes
+    DNS_TTL = 30  # 5 minutes
     # ==================================================
 
     def __init__(self, *args, **kwargs):
@@ -180,18 +178,6 @@ class MovingTargetDefense(app_manager.RyuApp):
             (o[2] ^ o[3]) & 0xFF,
         )
 
-    def _vip_to_cookie(self, vip: Optional[str]) -> Optional[int]:
-        if not vip:
-            return None
-        try:
-            parts = [int(x) for x in vip.split('.')]
-        except Exception:
-            return None
-        if len(parts) != 4:
-            return None
-        value = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
-        return self.VIP_COOKIE_BASE | value
-
     def _touch_vip(self, vip: str, ts: float, reason: str = "") -> None:
         if not vip:
             return
@@ -242,8 +228,7 @@ class MovingTargetDefense(app_manager.RyuApp):
         self._add_flow(dp, priority=0, match=match, actions=actions)
         self.logger.info("[SW] Switch %016x connected; installed table-miss", dp.id)
 
-    def _add_flow(self, dp, priority, match, actions, buffer_id=None, hard_timeout=0,
-                  idle_timeout=60, cookie=None):
+    def _add_flow(self, dp, priority, match, actions, buffer_id=None, hard_timeout=0, idle_timeout=60):
         parser = dp.ofproto_parser
         ofp = dp.ofproto
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
@@ -254,16 +239,14 @@ class MovingTargetDefense(app_manager.RyuApp):
                                     match=match,
                                     instructions=inst,
                                     hard_timeout=hard_timeout,
-                                    idle_timeout=idle_timeout,
-                                    cookie=cookie if cookie is not None else 0)
+                                    idle_timeout=idle_timeout)
         else:
             mod = parser.OFPFlowMod(datapath=dp,
                                     priority=priority,
                                     match=match,
                                     instructions=inst,
                                     hard_timeout=hard_timeout,
-                                    idle_timeout=idle_timeout,
-                                    cookie=cookie if cookie is not None else 0)
+                                    idle_timeout=idle_timeout)
         dp.send_msg(mod)
 
     # ---------------- housekeeping ----------------
@@ -289,11 +272,15 @@ class MovingTargetDefense(app_manager.RyuApp):
                     self._touch_vip(session.vip_src, now, "stats growth: vip_src")
             else:
                 age = now - session.last_growth
+                # CRITICAL: Drop session if no packet growth for timeout period
+                # Don't check VIP state - if packets stopped, session is stale regardless of VIP
+                # VIP will be cleaned up when session is detached
                 if age > self.SESSION_NO_GROWTH_TIMEOUT:
                     src_ip = session.src_ip_initial or session.key[0]
                     dst_ip = session.dst_ip_initial or session.key[1]
-                    self.logger.info("SESSION: drop %s -> %s (%.1fs no growth)",
-                                     src_ip, dst_ip, age)
+                    self.logger.info("SESSION: drop %s -> %s (%.1fs no growth, pkts=%d, last_reported=%d, vip_dst=%s, vip_src=%s)",
+                                     src_ip, dst_ip, age, session.packet_count, session.last_reported_count,
+                                     session.vip_dst or "None", session.vip_src or "None")
                     self._finalize_session(session_key, now, reason="session drop")
 
         self.logger.info("STATS: polled %d sessions", total)
@@ -353,16 +340,16 @@ class MovingTargetDefense(app_manager.RyuApp):
                 self._ensure_primary_vip(real_ip, now, force=True)
             return
 
-        # Check if we need to rotate (after 60s grace period)
+        # Check if we need to rotate (after 30s grace period)
         time_since_assignment = now - assigned_at
         
         if time_since_assignment >= self.VIP_ROTATION_INTERVAL:
-            # 60s grace period expired - now evaluate
+            # 30s grace period expired - now evaluate
             ever_active = self.host_primary_ever_active.get(real_ip, False)
             has_active_sessions = bool(self.vip_active_sessions.get(primary))
             
             if ever_active or has_active_sessions:
-                # Primary was active during the 60s OR still has active sessions
+                # Primary was active during the 30s OR still has active sessions
                 # Assign new primary for NEW sessions
                 # Old primary keeps its sessions until they end
                 self.logger.info("ROTATE: host %s primary VIP was active (ever=%s, has_sessions=%s), assigning new primary (old=%s)",
@@ -391,8 +378,8 @@ class MovingTargetDefense(app_manager.RyuApp):
                                      len(self.vip_active_sessions.get(old_primary, set())))
                     return
             else:
-                # Primary was NEVER active during the 60s grace period - drop it
-                self.logger.info("ROTATE: host %s primary VIP %s never active during 60s grace, dropping",
+                # Primary was NEVER active during the 30s grace period - drop it
+                self.logger.info("ROTATE: host %s primary VIP %s never active during 30s grace, dropping",
                                  real_ip, primary)
                 self._reclaim_vip(primary, rebalance=False)
                 # Assign new primary (may be same VIP if it was just reclaimed)
@@ -412,44 +399,45 @@ class MovingTargetDefense(app_manager.RyuApp):
                     hub.spawn(_async_arp_announce)
                     return
         else:
-            # Still within 60s grace period - don't check anything, just wait
+            # Still within 30s grace period - don't check anything, just wait
             # Primary VIP has time to become active
             pass
         
-        # Clean up old non-primary VIPs that no longer have sessions
-        # IMPORTANT: Only reclaim VIPs that have NO active sessions
-        # Old primary VIPs will keep their sessions until they end
+        # Clean up old non-primary VIPs that are idle (no active sessions)
+        # CRITICAL: Non-primary VIPs get a small grace period (5s) to avoid race conditions
+        # Only primary VIPs get the 30s grace period
         pool = self.host_vip_pools.get(real_ip, set())
         current_primary = self.host_primary_vip.get(real_ip)
         for vip in list(pool):
             if vip == current_primary:
-                continue  # Skip current primary
+                continue  # Skip current primary - it gets grace period handled above
             active_sessions = self.vip_active_sessions.get(vip)
             if not active_sessions:  # No active sessions
-                # Old VIP with no sessions - reclaim it immediately
-                self.logger.info("CLEANUP: reclaiming old VIP %s from host %s (no active sessions)",
-                                vip, real_ip)
-                self._reclaim_vip(vip, rebalance=False)
+                # Check if VIP has been idle for at least 5 seconds to avoid race conditions
+                # This prevents reclaiming VIPs that just lost a session but might get new ones
+                last_activity = self.vip_last_activity.get(vip, 0)
+                idle_time = now - last_activity
+                if idle_time >= 5.0:  # 5 second grace period for non-primary VIPs
+                    # Non-primary VIP has been idle for 5+ seconds - safe to reclaim
+                    self.logger.info("CLEANUP: reclaiming non-primary VIP %s from host %s (idle for %.1fs, no active sessions)",
+                                    vip, real_ip, idle_time)
+                    # CRITICAL: Reclaim asynchronously to avoid blocking packet processing
+                    def _async_reclaim():
+                        self._reclaim_vip(vip, rebalance=False)
+                    try:
+                        hub.spawn(_async_reclaim)
+                    except Exception as e:
+                        self.logger.warning("CLEANUP: async reclaim failed for VIP %s: %s", vip, e)
+                        # Fall back to sync if async fails
+                        self._reclaim_vip(vip, rebalance=False)
+                else:
+                    # VIP just became idle - wait a bit longer
+                    self.logger.debug("CLEANUP: keeping non-primary VIP %s from host %s (idle for %.1fs, waiting for 5s grace)",
+                                     vip, real_ip, idle_time)
             else:
-                # Old VIP still has active sessions - keep it
-                self.logger.debug("CLEANUP: keeping old VIP %s from host %s (%d active sessions)",
+                # Non-primary VIP still has active sessions - keep it
+                self.logger.debug("CLEANUP: keeping non-primary VIP %s from host %s (%d active sessions)",
                                  vip, real_ip, len(active_sessions))
-
-    def _rebalance_host_vips(self, real_ip: str, now: float) -> None:
-        if real_ip not in self.detected_hosts:
-            return
-        primary = self._ensure_primary_vip(real_ip, now, force=True)
-        pool = self.host_vip_pools.get(real_ip, set())
-        if primary and primary not in pool:
-            pool.add(primary)
-        for vip in list(pool):
-            if vip == primary:
-                continue
-            if self.vip_active_sessions.get(vip):
-                continue
-            if self.host_primary_vip.get(real_ip) == vip:
-                continue
-            self._reclaim_vip(vip, rebalance=False)
 
     def _ensure_primary_vip(self, real_ip: str, now: float, *, force: bool = False) -> Optional[str]:
         """Ensure host has a primary VIP. Returns the primary VIP."""
@@ -490,7 +478,8 @@ class MovingTargetDefense(app_manager.RyuApp):
             old_owner_sessions = self.vip_active_sessions.get(vip)
             if not old_owner_sessions:
                 # No active sessions - safe to purge flows
-                self._purge_flows_for_vip(vip)
+                # CRITICAL: Purge flows asynchronously to avoid blocking packet processing
+                self._purge_flows_for_vip(vip, run_async=True)
             # If there are active sessions, don't purge flows - they're still needed
         # Note: If VIP was reclaimed, flows were already purged in _reclaim_vip
         # But we still need to ensure flows are clean for immediate reassignment
@@ -890,7 +879,6 @@ class MovingTargetDefense(app_manager.RyuApp):
             
             if vip_src:
                 session.vip_src = vip_src
-                session.forward_flow_cookie = None
                 session.active_target_vip = vip_dst
                 if vip_dst:
                     session.vip_src_by_target[vip_dst] = vip_src
@@ -968,13 +956,13 @@ class MovingTargetDefense(app_manager.RyuApp):
 
             if not vip_src and proto == 1:
                 for candidate in (icmp_bound_vip, mapping_vip, session.last_reply_vip):
-                    if _owns(candidate):
+                    if candidate and self.V2R_Mappings.get(candidate) == server_real:
                         vip_src = candidate
                         break
 
             if not vip_src and proto != 1:
                 for candidate in (session.vip_locked, mapping_vip, contacted_vip, session.last_reply_vip):
-                    if _owns(candidate):
+                    if candidate and self.V2R_Mappings.get(candidate) == server_real:
                         vip_src = candidate
                         break
 
@@ -998,8 +986,6 @@ class MovingTargetDefense(app_manager.RyuApp):
                 self.vip_mac_map[vip_src] = mac
                 actions.append(parser.OFPActionSetField(ipv4_src=vip_src))
                 actions.append(parser.OFPActionSetField(eth_src=mac))
-                if session.last_reply_vip != vip_src:
-                    session.reverse_flow_cookie = None
                 session.last_reply_vip = vip_src
                 key = self._compose_reply_key(server_real, client_real, proto,
                                                client_port, server_port)
@@ -1038,11 +1024,6 @@ class MovingTargetDefense(app_manager.RyuApp):
                 out_port = self.mac_to_port.get(dpid, {}).get(forward_dst_mac, ofp.OFPP_FLOOD)
             actions.append(parser.OFPActionOutput(out_port))
 
-        if actions:
-            self._maybe_install_icmp_flow(dp, parser, ofp, in_port, out_port,
-                                          src_ip, dst_ip, proto, icmp_pkt,
-                                          actions, direction, session)
-
         if msg.buffer_id == ofp.OFP_NO_BUFFER:
             data = msg.data
         else:
@@ -1070,8 +1051,67 @@ class MovingTargetDefense(app_manager.RyuApp):
 
     def _classify_flow(self, src_ip: str, dst_ip: str, proto: int,
                        src_port: int, dst_port: int):
-        src_real = self.V2R_Mappings.get(src_ip, src_ip)
-        dst_real = self.V2R_Mappings.get(dst_ip, dst_ip)
+        # CRITICAL: Always resolve VIPs to real IPs, even if VIP was recently reclaimed
+        # Check V2R_Mappings first, then check host_vip_pools as fallback
+        src_real = self.V2R_Mappings.get(src_ip)
+        if not src_real:
+            # VIP not in V2R_Mappings - check if it's in any host's VIP pool
+            # This handles the case where VIP was reclaimed but packets are still in flight
+            for real_ip, pool in self.host_vip_pools.items():
+                if src_ip in pool:
+                    src_real = real_ip
+                    break
+            if not src_real:
+                # If IP is in VIP range (10.0.0.11+) and not in detected_hosts, it's likely a VIP
+                # Try to find it in existing sessions to determine the real IP
+                try:
+                    ip_parts = [int(x) for x in src_ip.split('.')]
+                    if len(ip_parts) == 4 and ip_parts[0] == 10 and ip_parts[1] == 0 and ip_parts[2] == 0 and ip_parts[3] >= 11:
+                        # Likely a VIP - search existing sessions for this VIP
+                        for session_key, session in self.session_table.items():
+                            if session.vip_src == src_ip or session.vip_dst == src_ip:
+                                # Found a session using this VIP - use the real IP from session key
+                                # For vip_src, the real IP is the first element of the key (client)
+                                # For vip_dst, the real IP is the second element of the key (server)
+                                if session.vip_src == src_ip:
+                                    src_real = session.key[0]  # Client real IP
+                                elif session.vip_dst == src_ip:
+                                    src_real = session.key[1]  # Server real IP
+                                break
+                except (ValueError, AttributeError):
+                    pass
+                if not src_real:
+                    # Not a VIP or couldn't resolve - use as-is (real IP)
+                    src_real = src_ip
+        
+        dst_real = self.V2R_Mappings.get(dst_ip)
+        if not dst_real:
+            # VIP not in V2R_Mappings - check if it's in any host's VIP pool
+            for real_ip, pool in self.host_vip_pools.items():
+                if dst_ip in pool:
+                    dst_real = real_ip
+                    break
+            if not dst_real:
+                # If IP is in VIP range (10.0.0.11+) and not in detected_hosts, it's likely a VIP
+                # Try to find it in existing sessions to determine the real IP
+                try:
+                    ip_parts = [int(x) for x in dst_ip.split('.')]
+                    if len(ip_parts) == 4 and ip_parts[0] == 10 and ip_parts[1] == 0 and ip_parts[2] == 0 and ip_parts[3] >= 11:
+                        # Likely a VIP - search existing sessions for this VIP
+                        for session_key, session in self.session_table.items():
+                            if session.vip_src == dst_ip or session.vip_dst == dst_ip:
+                                # Found a session using this VIP - use the real IP from session key
+                                if session.vip_src == dst_ip:
+                                    dst_real = session.key[0]  # Client real IP
+                                elif session.vip_dst == dst_ip:
+                                    dst_real = session.key[1]  # Server real IP
+                                break
+                except (ValueError, AttributeError):
+                    pass
+                if not dst_real:
+                    # Not a VIP or couldn't resolve - use as-is (real IP)
+                    dst_real = dst_ip
+        
         forward_key = (src_real, dst_real, proto, src_port, dst_port)
         reverse_key = (dst_real, src_real, proto, dst_port, src_port)
         
@@ -1142,14 +1182,15 @@ class MovingTargetDefense(app_manager.RyuApp):
             owner = self.V2R_Mappings.get(vip)
             released = self._detach_session_from_vip(vip, session_key)
             if released and owner:
-                # If VIP is no longer primary, it can be reclaimed
+                # CRITICAL: Don't reclaim VIPs immediately when sessions end
+                # This causes ping drops during active traffic due to race conditions
+                # Let housekeeping (every 15s) handle idle VIP cleanup instead
+                # Only evaluate host state for primary VIP rotation logic
                 primary = self.host_primary_vip.get(owner)
-                if vip != primary:
-                    # Old non-primary VIP - check if it should be reclaimed
+                if vip == primary:
+                    # Primary VIP - evaluate for rotation logic only
                     self._evaluate_host_state(owner, ts)
-                else:
-                    # Primary VIP - evaluate to see if it needs rotation
-                    self._evaluate_host_state(owner, ts)
+                # For non-primary VIPs, housekeeping will clean them up when idle
 
         flow_key = (session.key[0], session.key[1], session.proto, session.key[3], session.key[4])
         reverse_key = (session.key[1], session.key[0], session.proto, session.key[4], session.key[3])
@@ -1213,7 +1254,35 @@ class MovingTargetDefense(app_manager.RyuApp):
         self.logger.info("ALLOC: on-demand VIP %s -> %s", vip, real_ip)
         return vip
 
-    def _purge_flows_for_vip(self, vip: str, *, include_mac: bool = True) -> None:
+    def _purge_flows_for_vip(self, vip: str, *, include_mac: bool = True, run_async: bool = False) -> None:
+        """
+        Purge flows for a VIP. If run_async=True, runs in background to avoid blocking.
+        
+        CRITICAL: Never purge flows for VIPs with active sessions - they're still needed!
+        This prevents packet loss during VIP rotation when old primary still has sessions.
+        """
+        # CRITICAL: Check if VIP has active sessions - if so, don't purge flows!
+        # Old primary VIPs keep their flows until sessions end
+        if self.vip_active_sessions.get(vip):
+            self.logger.debug("FLOW: skipping purge for VIP %s (has %d active sessions)",
+                            vip, len(self.vip_active_sessions[vip]))
+            return
+        
+        if run_async:
+            # Run flow purging in background to avoid blocking packet processing
+            def _async_purge():
+                self._purge_flows_for_vip_sync(vip, include_mac=include_mac)
+            try:
+                hub.spawn(_async_purge)
+            except Exception as e:
+                self.logger.warning("FLOW: async purge failed for VIP %s: %s", vip, e)
+                # Fall back to sync if async fails
+                self._purge_flows_for_vip_sync(vip, include_mac=include_mac)
+        else:
+            self._purge_flows_for_vip_sync(vip, include_mac=include_mac)
+    
+    def _purge_flows_for_vip_sync(self, vip: str, *, include_mac: bool = True) -> None:
+        """Synchronous flow purging (internal use only)."""
         mac = self.vip_mac_map.get(vip)
         if not mac:
             mac = self._generate_vip_mac(vip)
@@ -1251,16 +1320,15 @@ class MovingTargetDefense(app_manager.RyuApp):
                 )
                 dp.send_msg(mod)
 
-            # Ensure the controller receives notification once the deletions are
-            # processed so newly arriving packets hit the table-miss path
-            # immediately instead of waiting for idle timers.
-            try:
-                barrier = parser.OFPBarrierRequest(dp)
-                dp.send_msg(barrier)
-            except Exception:
-                # Barrier support is optional; fall back silently if the switch
-                # rejects the request.  A warning would be too noisy here.
-                pass
+            # CRITICAL: Don't wait for barrier - it blocks packet processing!
+            # Flow deletions will complete asynchronously. New packets will hit
+            # table-miss and be handled by controller, which is fine.
+            # Only send barrier if absolutely necessary (not recommended for production)
+            # try:
+            #     barrier = parser.OFPBarrierRequest(dp)
+            #     dp.send_msg(barrier)
+            # except Exception:
+            #     pass
 
         if include_mac and mac:
             detail = "IP & MAC matches removed"
@@ -1433,7 +1501,9 @@ class MovingTargetDefense(app_manager.RyuApp):
                 self.icmp_echo_map.pop(key, None)
         # Purge flows BEFORE putting VIP back in Resources
         # This ensures flows are fully deleted before VIP can be reused
-        self._purge_flows_for_vip(vip)
+        # CRITICAL: Purge flows asynchronously to avoid blocking packet processing
+        # Only purge if VIP has no active sessions (checked inside _purge_flows_for_vip)
+        self._purge_flows_for_vip(vip, run_async=True)
         if vip not in self.Resources:
             # If this was a primary VIP, put it at the END to avoid immediate reassignment
             # For non-primary VIPs, put at front (normal behavior)
