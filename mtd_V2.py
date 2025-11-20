@@ -50,6 +50,8 @@ class SessionRecord:
     reverse_dst_initial: str = ""
     proto: int = 0
     reply_keys: Set[Tuple] = field(default_factory=set)
+    forward_flow_cookie: Optional[int] = None
+    reverse_flow_cookie: Optional[int] = None
 
 
 class EventMessage(event.EventBase):
@@ -72,7 +74,7 @@ class MovingTargetDefense(app_manager.RyuApp):
 
     INITIAL_ASSIGN_ON_DISCOVERY = True
 
-    ICMP_INSTALL_FLOWS = False
+    ICMP_INSTALL_FLOWS = True
     ICMP_FLOW_IDLE = 5
     
     # DNS config
@@ -178,6 +180,18 @@ class MovingTargetDefense(app_manager.RyuApp):
             (o[2] ^ o[3]) & 0xFF,
         )
 
+    def _vip_to_cookie(self, vip: Optional[str]) -> Optional[int]:
+        if not vip:
+            return None
+        try:
+            parts = [int(x) for x in vip.split('.')]
+        except Exception:
+            return None
+        if len(parts) != 4:
+            return None
+        value = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
+        return self.VIP_COOKIE_BASE | value
+
     def _touch_vip(self, vip: str, ts: float, reason: str = "") -> None:
         if not vip:
             return
@@ -250,7 +264,8 @@ class MovingTargetDefense(app_manager.RyuApp):
         self._add_flow(dp, priority=0, match=match, actions=actions)
         self.logger.info("[SW] Switch %016x connected; installed table-miss", dp.id)
 
-    def _add_flow(self, dp, priority, match, actions, buffer_id=None, hard_timeout=0, idle_timeout=60):
+    def _add_flow(self, dp, priority, match, actions, buffer_id=None, hard_timeout=0,
+                  idle_timeout=60, cookie=None):
         parser = dp.ofproto_parser
         ofp = dp.ofproto
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
@@ -261,14 +276,16 @@ class MovingTargetDefense(app_manager.RyuApp):
                                     match=match,
                                     instructions=inst,
                                     hard_timeout=hard_timeout,
-                                    idle_timeout=idle_timeout)
+                                    idle_timeout=idle_timeout,
+                                    cookie=cookie if cookie is not None else 0)
         else:
             mod = parser.OFPFlowMod(datapath=dp,
                                     priority=priority,
                                     match=match,
                                     instructions=inst,
                                     hard_timeout=hard_timeout,
-                                    idle_timeout=idle_timeout)
+                                    idle_timeout=idle_timeout,
+                                    cookie=cookie if cookie is not None else 0)
         dp.send_msg(mod)
 
     # ---------------- housekeeping ----------------
@@ -298,6 +315,29 @@ class MovingTargetDefense(app_manager.RyuApp):
                 # Don't check VIP state - if packets stopped, session is stale regardless of VIP
                 # VIP will be cleaned up when session is detached
                 if age > self.SESSION_NO_GROWTH_TIMEOUT:
+                    # If dataplane flows are installed we may not see packets
+                    # on the controller path, so treat the session as alive and
+                    # refresh its timer instead of prematurely finalizing it.
+                    if (session.forward_flow_cookie is not None or
+                            session.reverse_flow_cookie is not None):
+                        session.last_growth = now
+
+                        refreshed: Set[str] = set()
+                        for vip in (session.vip_src,
+                                    session.vip_locked,
+                                    session.vip_dst,
+                                    session.last_reply_vip):
+                            if not vip or vip in refreshed:
+                                continue
+                            refreshed.add(vip)
+                            self._touch_vip(vip, now, "flow-active session")
+                            self._activate_vip_for_session(vip, session_key, now)
+
+                        if session.vip_src:
+                            session.last_vip_src_use = now
+
+                        continue
+
                     src_ip = session.src_ip_initial or session.key[0]
                     dst_ip = session.dst_ip_initial or session.key[1]
                     self.logger.info("SESSION: drop %s -> %s (%.1fs no growth, pkts=%d, last_reported=%d, vip_dst=%s, vip_src=%s)",
@@ -462,6 +502,22 @@ class MovingTargetDefense(app_manager.RyuApp):
                 # Non-primary VIP still has active sessions - keep it
                 self.logger.debug("CLEANUP: keeping non-primary VIP %s from host %s (%d active sessions)",
                                  vip, real_ip, len(active_sessions))
+
+    def _rebalance_host_vips(self, real_ip: str, now: float) -> None:
+        if real_ip not in self.detected_hosts:
+            return
+        primary = self._ensure_primary_vip(real_ip, now, force=True)
+        pool = self.host_vip_pools.get(real_ip, set())
+        if primary and primary not in pool:
+            pool.add(primary)
+        for vip in list(pool):
+            if vip == primary:
+                continue
+            if self.vip_active_sessions.get(vip):
+                continue
+            if self.host_primary_vip.get(real_ip) == vip:
+                continue
+            self._reclaim_vip(vip, rebalance=False)
 
     def _ensure_primary_vip(self, real_ip: str, now: float, *, force: bool = False) -> Optional[str]:
         """Ensure host has a primary VIP. Returns the primary VIP."""
@@ -899,6 +955,7 @@ class MovingTargetDefense(app_manager.RyuApp):
             
             if vip_src:
                 session.vip_src = vip_src
+                session.forward_flow_cookie = None
                 session.active_target_vip = vip_dst
                 if vip_dst:
                     session.vip_src_by_target[vip_dst] = vip_src
@@ -936,11 +993,12 @@ class MovingTargetDefense(app_manager.RyuApp):
                 echo_seq = getattr(icmp_pkt.data, "seq", None)
                 if echo_id is not None and echo_seq is not None:
                     key = (server_real, client_real, int(echo_id), int(echo_seq))
-                    stored = self.icmp_echo_map.pop(key, None)
+                    stored = self.icmp_echo_map.get(key)
                     if stored:
                         candidate_vip, _stored_ts = stored
                         if self.V2R_Mappings.get(candidate_vip) == server_real:
                             icmp_bound_vip = candidate_vip
+                            self.icmp_echo_map.pop(key, None)
 
             # NEW LOGIC: Prefer the primary VIP for replies (if it matches the session)
             primary_reply_vip = self.host_primary_vip.get(server_real)
@@ -1006,6 +1064,8 @@ class MovingTargetDefense(app_manager.RyuApp):
                 self.vip_mac_map[vip_src] = mac
                 actions.append(parser.OFPActionSetField(ipv4_src=vip_src))
                 actions.append(parser.OFPActionSetField(eth_src=mac))
+                if session.last_reply_vip != vip_src:
+                    session.reverse_flow_cookie = None
                 session.last_reply_vip = vip_src
                 key = self._compose_reply_key(server_real, client_real, proto,
                                                client_port, server_port)
@@ -1043,6 +1103,13 @@ class MovingTargetDefense(app_manager.RyuApp):
             if forward_dst_mac:
                 out_port = self.mac_to_port.get(dpid, {}).get(forward_dst_mac, ofp.OFPP_FLOOD)
             actions.append(parser.OFPActionOutput(out_port))
+
+        if actions:
+            maybe_icmp = getattr(self, "_maybe_install_icmp_flow", None)
+            if maybe_icmp:
+                maybe_icmp(dp, parser, ofp, in_port, out_port,
+                           src_ip, dst_ip, proto, icmp_pkt,
+                           actions, direction, session)
 
         if msg.buffer_id == ofp.OFP_NO_BUFFER:
             data = msg.data
