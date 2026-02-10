@@ -468,10 +468,12 @@ class MovingTargetDefense(app_manager.RyuApp):
         dst_port = tcp_pkt.dst_port if tcp_pkt else (udp_pkt.dst_port if udp_pkt else 0)
         if proto == 1 and icmp_pkt and hasattr(icmp_pkt, "data"):
             echo_id = getattr(icmp_pkt.data, "id", None)
-            if echo_id is not None:
-                # Keep ICMP session continuity across rotation by keying the
-                # session on echo-id (stable for a ping process), not seq.
-                icmp_token = int(echo_id) & 0xFFFF
+            echo_seq = getattr(icmp_pkt.data, "seq", None)
+            if echo_id is not None and echo_seq is not None:
+                # Use a symmetric synthetic "port" token for ICMP flows so
+                # request/reply packets map to one session, while each
+                # echo-id/seq pair gets its own session across rotations.
+                icmp_token = ((int(echo_id) & 0xFFFF) << 16) | (int(echo_seq) & 0xFFFF)
                 src_port = icmp_token
                 dst_port = icmp_token
         now = time()
