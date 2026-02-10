@@ -213,43 +213,6 @@ class MovingTargetDefense(app_manager.RyuApp):
         self.logger.info("VIP: assigned primary %s -> %s", real_ip, vip)
         return vip
 
-    def _extract_icmp_echo_fields(self, icmp_pkt) -> Tuple[Optional[int], Optional[int]]:
-        """Extract ICMP echo id/seq robustly across payload shapes."""
-        if not icmp_pkt or not hasattr(icmp_pkt, "data"):
-            return None, None
-        echo_id = getattr(icmp_pkt.data, "id", None)
-        echo_seq = getattr(icmp_pkt.data, "seq", None)
-
-        if echo_id is None:
-            return None, None
-
-        try:
-            echo_id = int(echo_id)
-        except Exception:
-            return None, None
-
-        # Some packet decoders expose packed id|seq in one field.
-        # When detected, always treat high-16 bits as echo-id (stable across
-        # a ping stream) and low-16 bits as sequence.
-        if echo_id > 0xFFFF:
-            packed = echo_id
-            packed_hi = (packed >> 16) & 0xFFFF
-            packed_lo = packed & 0xFFFF
-            seq_i = None
-            if echo_seq is not None:
-                try:
-                    seq_i = int(echo_seq) & 0xFFFF
-                except Exception:
-                    seq_i = None
-            return packed_hi, (seq_i if seq_i is not None else packed_lo)
-
-        try:
-            echo_seq_i = int(echo_seq) & 0xFFFF if echo_seq is not None else None
-        except Exception:
-            echo_seq_i = None
-
-        return echo_id & 0xFFFF, echo_seq_i
-
     # Removed: _flag_vip_idle and _start_idle_timer
     # Primary VIP rotation uses immediate reclaim based on session count, not idle timers
 
@@ -502,19 +465,16 @@ class MovingTargetDefense(app_manager.RyuApp):
         src_ip, dst_ip, proto = ip4.src, ip4.dst, ip4.proto
         src_port = tcp_pkt.src_port if tcp_pkt else (udp_pkt.src_port if udp_pkt else 0)
         dst_port = tcp_pkt.dst_port if tcp_pkt else (udp_pkt.dst_port if udp_pkt else 0)
-        if proto == 1:
-            echo_id, _echo_seq = self._extract_icmp_echo_fields(icmp_pkt)
-            if echo_id is not None:
-                # Keep ICMP session continuity across rotation by keying the
-                # session on echo-id (stable for a ping process), not seq.
-                icmp_token = int(echo_id) & 0xFFFF
+        if proto == 1 and icmp_pkt and hasattr(icmp_pkt, "data"):
+            echo_id = getattr(icmp_pkt.data, "id", None)
+            echo_seq = getattr(icmp_pkt.data, "seq", None)
+            if echo_id is not None and echo_seq is not None:
+                # Use a symmetric synthetic "port" token for ICMP flows so
+                # request/reply packets map to one session, while each
+                # echo-id/seq pair gets its own session across rotations.
+                icmp_token = ((int(echo_id) & 0xFFFF) << 16) | (int(echo_seq) & 0xFFFF)
                 src_port = icmp_token
                 dst_port = icmp_token
-            else:
-                # Fallback for uncommon ICMP payload shapes: keep a stable key
-                # so one ongoing flow does not get remapped on rotation.
-                src_port = 0
-                dst_port = 0
         now = time()
         # self.logger.info("PACKET: %s -> %s (proto %d)", src_ip, dst_ip, proto)
 
@@ -621,8 +581,9 @@ class MovingTargetDefense(app_manager.RyuApp):
             self._register_reply_mapping(session, server_real, client_real,
                                          proto, vip_dst, client_port, server_port,
                                          icmp_pkt, tcp_pkt, udp_pkt)
-            if icmp_pkt and getattr(icmp_pkt, "type", None) == 8:
-                echo_id, _echo_seq = self._extract_icmp_echo_fields(icmp_pkt)
+            if (icmp_pkt and getattr(icmp_pkt, "type", None) == 8 and
+                    hasattr(icmp_pkt, "data")):
+                echo_id = getattr(icmp_pkt.data, "id", None)
                 if echo_id is not None:
                     key = (server_real, client_real, int(echo_id))
                     self.icmp_echo_map[key] = (vip_dst, now)
@@ -763,8 +724,8 @@ class MovingTargetDefense(app_manager.RyuApp):
             elif session.last_reply_vip and self.V2R_Mappings.get(session.last_reply_vip) == server_real:
                 vip_src = session.last_reply_vip
             # Priority 4: For ICMP, check echo map
-            elif proto == 1 and icmp_pkt and getattr(icmp_pkt, "type", None) == 0:
-                echo_id, _echo_seq = self._extract_icmp_echo_fields(icmp_pkt)
+            elif proto == 1 and icmp_pkt and getattr(icmp_pkt, "type", None) == 0 and hasattr(icmp_pkt, "data"):
+                echo_id = getattr(icmp_pkt.data, "id", None)
                 if echo_id is not None:
                     key = (server_real, client_real, int(echo_id))
                     stored = self.icmp_echo_map.get(key)
