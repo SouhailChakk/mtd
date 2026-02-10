@@ -455,6 +455,16 @@ class MovingTargetDefense(app_manager.RyuApp):
         src_ip, dst_ip, proto = ip4.src, ip4.dst, ip4.proto
         src_port = tcp_pkt.src_port if tcp_pkt else (udp_pkt.src_port if udp_pkt else 0)
         dst_port = tcp_pkt.dst_port if tcp_pkt else (udp_pkt.dst_port if udp_pkt else 0)
+        if proto == 1 and icmp_pkt and hasattr(icmp_pkt, "data"):
+            echo_id = getattr(icmp_pkt.data, "id", None)
+            echo_seq = getattr(icmp_pkt.data, "seq", None)
+            if echo_id is not None and echo_seq is not None:
+                # Use a symmetric synthetic "port" token for ICMP flows so
+                # request/reply packets map to one session, while each
+                # echo-id/seq pair gets its own session across rotations.
+                icmp_token = ((int(echo_id) & 0xFFFF) << 16) | (int(echo_seq) & 0xFFFF)
+                src_port = icmp_token
+                dst_port = icmp_token
         now = time()
         # self.logger.info("PACKET: %s -> %s (proto %d)", src_ip, dst_ip, proto)
 
@@ -914,7 +924,7 @@ class MovingTargetDefense(app_manager.RyuApp):
     def _compose_reply_key(self, server_real: str, client_real: str,
                            proto: int, client_port: int, server_port: int) -> Tuple[str, str, int, int, int]:
         if proto == 1:
-            return (server_real, client_real, 1, 0, 0)
+            return (server_real, client_real, 1, client_port, server_port)
         if proto == 6:
             return (server_real, client_real, 6, client_port, server_port)
         if proto == 17:
