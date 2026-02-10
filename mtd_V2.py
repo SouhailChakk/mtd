@@ -180,13 +180,39 @@ class MovingTargetDefense(app_manager.RyuApp):
             return
         if self.vip_sessions[vip] > 0:
             self.vip_sessions[vip] -= 1
-        
+
         # If this VIP is NOT the current primary for its host and is now idle, reclaim immediately
         if self.vip_sessions[vip] == 0:
             owner = self.V2R_Mappings.get(vip)
             if owner and vip != self.primary_vip.get(owner):
                 self.logger.info("RECLAIM: Lingering VIP %s (no sessions, not primary)", vip)
                 self._reclaim_vip(vip)
+
+    def _check_active_sessions(self, vip: str) -> bool:
+        """Return True if any active session still references this VIP."""
+        if self.vip_sessions.get(vip, 0) > 0:
+            return True
+        for session in self.session_table.values():
+            if vip in (session.vip_dst, session.vip_src, session.vip_locked, session.last_reply_vip):
+                return True
+        return False
+
+    def _ensure_primary_vip(self, real_ip: str, now: float) -> Optional[str]:
+        """Ensure a host has exactly one primary VIP and return it."""
+        current = self.primary_vip.get(real_ip)
+        if current and self.V2R_Mappings.get(current) == real_ip:
+            return current
+        vip = self._take_resource_vip(now)
+        if not vip:
+            self.logger.error("VIP: unable to assign primary for %s (pool exhausted)", real_ip)
+            return None
+        self._bind_vip_to_host(vip, real_ip, now)
+        self.primary_vip[real_ip] = vip
+        self.lingering_vips[real_ip] = set()
+        self._send_gratuitous_arp_to_all(vip)
+        self._send_targeted_arp_updates(vip)
+        self.logger.info("VIP: assigned primary %s -> %s", real_ip, vip)
+        return vip
 
     # Removed: _flag_vip_idle and _start_idle_timer
     # Primary VIP rotation uses immediate reclaim based on session count, not idle timers
@@ -358,22 +384,7 @@ class MovingTargetDefense(app_manager.RyuApp):
                 if old_vip:
                     # CRITICAL: Check if old VIP is used by ANY active session BEFORE deleting flows
                     # Must check ALL session fields: vip_dst, vip_src, vip_locked, last_reply_vip
-                    has_active_sessions = False
-                    
-                    # First check refcount
-                    if self.vip_sessions[old_vip] > 0:
-                        has_active_sessions = True
-                    else:
-                        # Also check session table directly - check ALL fields that might use this VIP
-                        for session in list(self.session_table.values()):
-                            if (session.vip_dst == old_vip or 
-                                session.vip_src == old_vip or 
-                                session.vip_locked == old_vip or
-                                session.last_reply_vip == old_vip):
-                                has_active_sessions = True
-                                self.logger.info("ROTATE: Found active session using old VIP %s: vip_dst=%s vip_src=%s vip_locked=%s last_reply_vip=%s",
-                                                old_vip, session.vip_dst, session.vip_src, session.vip_locked, session.last_reply_vip)
-                                break
+                    has_active_sessions = self._check_active_sessions(old_vip)
                     
                     if has_active_sessions:
                         # Old is still in active sessions: keep as lingering
@@ -509,17 +520,15 @@ class MovingTargetDefense(app_manager.RyuApp):
                     real_dst = server_real
         # For new sessions, use primary VIP for the destination host
         elif direction == 'forward' and new_session:
-            # New session: use primary VIP for destination host
-            if server_real in self.primary_vip:
-                vip_dst = self.primary_vip[server_real]
-                real_dst = server_real
-                # Track that this session uses this VIP
-                self._on_session_start(vip_dst)
-            elif dst_ip in self.V2R_Mappings:
-                # Fallback: destination is already a VIP (lingering)
-                vip_dst = dst_ip
-                real_dst = self.V2R_Mappings[dst_ip]
-                self._on_session_start(vip_dst)
+            # New session: MUST use current primary VIP for destination host.
+            if server_real in self.detected_hosts:
+                vip_dst = self._ensure_primary_vip(server_real, now)
+                if vip_dst:
+                    real_dst = server_real
+                    self._on_session_start(vip_dst)
+                else:
+                    # Allocation failure: keep routing to real destination, keep old primary if any.
+                    real_dst = server_real
             else:
                 # External destination or unknown
                 real_dst = dst_ip
@@ -565,7 +574,6 @@ class MovingTargetDefense(app_manager.RyuApp):
             # If replies were previously using a different VIP, detach it so a
             # reclaimed VIP cannot linger as the preferred reverse mapping.
             if session.last_reply_vip and session.last_reply_vip != vip_dst:
-                self._on_session_end(session.last_reply_vip)
                 self._mark_vip_reuse(session.last_reply_vip, now)
                 session.last_reply_vip = None
             if proto != 1 and not session.vip_locked:
@@ -604,7 +612,6 @@ class MovingTargetDefense(app_manager.RyuApp):
             if binding_vip and vip_src and vip_src != binding_vip:
                 previous_vip_src = vip_src
                 previous_target = session.active_target_vip
-                self._on_session_end(previous_vip_src)
                 self._mark_vip_reuse(previous_vip_src, now)
                 session.vip_src = None
                 vip_src = None
@@ -650,7 +657,6 @@ class MovingTargetDefense(app_manager.RyuApp):
                 need_new_vip = True
 
             if need_new_vip and previous_vip_src:
-                self._on_session_end(previous_vip_src)
                 self._mark_vip_reuse(previous_vip_src, now)
                 if previous_target:
                     session.vip_src_by_target.pop(previous_target, None)
@@ -747,7 +753,6 @@ class MovingTargetDefense(app_manager.RyuApp):
                 previous_reply_vip = session.last_reply_vip
                 freed_prev = False
                 if previous_reply_vip and previous_reply_vip != vip_src:
-                    self._on_session_end(previous_reply_vip)
                     self._mark_vip_reuse(previous_reply_vip, now)
                 if proto != 1:
                     session.vip_locked = vip_src
@@ -880,11 +885,10 @@ class MovingTargetDefense(app_manager.RyuApp):
         if self.reply_vip_pair.get(pair_key) == session.vip_locked:
             self.reply_vip_pair.pop(pair_key, None)
 
-        # Decrement session count for VIPs used by this session
-        for vip in {session.vip_src, session.vip_locked, session.vip_dst, session.last_reply_vip}:
-            if vip:
-                self._on_session_end(vip)
-                self._mark_vip_reuse(vip, ts)
+        # Decrement refcount only for destination VIP tracked by session start.
+        if session.vip_dst:
+            self._on_session_end(session.vip_dst)
+            self._mark_vip_reuse(session.vip_dst, ts)
 
         flow_key = (session.key[0], session.key[1], session.proto, session.key[3], session.key[4])
         reverse_key = (session.key[1], session.key[0], session.proto, session.key[4], session.key[3])
@@ -1075,19 +1079,10 @@ class MovingTargetDefense(app_manager.RyuApp):
         """Reclaim a VIP. CRITICAL: Only call this if VIP has NO active sessions."""
         reclaim_ts = time()
         
-        # SAFETY CHECK: Verify VIP is not in active sessions before reclaiming
-        if self.vip_sessions[vip] > 0:
-            self.logger.warning("RECLAIM: Attempted to reclaim VIP %s with active sessions (count=%d), aborting",
-                              vip, self.vip_sessions[vip])
+        # SAFETY CHECK: Verify VIP is not in active sessions before reclaiming.
+        if self._check_active_sessions(vip):
+            self.logger.warning("RECLAIM: Attempted to reclaim VIP %s with active sessions, aborting", vip)
             return
-        
-        # Double-check session table - check ALL fields that might use this VIP
-        for session in self.session_table.values():
-            if (session.vip_dst == vip or session.vip_src == vip or 
-                session.vip_locked == vip or session.last_reply_vip == vip):
-                self.logger.warning("RECLAIM: Attempted to reclaim VIP %s used by active session (vip_dst=%s vip_src=%s vip_locked=%s last_reply_vip=%s), aborting",
-                                  vip, session.vip_dst, session.vip_src, session.vip_locked, session.last_reply_vip)
-                return
         
         real_ip = self.V2R_Mappings.pop(vip, None)
         if not real_ip:
@@ -1128,9 +1123,13 @@ class MovingTargetDefense(app_manager.RyuApp):
         for key, value in list(self.session_last_contacted_vip.items()):
             if value == vip:
                 self.session_last_contacted_vip.pop(key, None)
-        for session_key, session in list(self.session_table.items()):
-            if session.vip_dst == vip or session.vip_src == vip or session.vip_locked == vip:
-                self._finalize_session(session_key, reclaim_ts, reason="vip reclaim")
+        for session in self.session_table.values():
+            if session.last_reply_vip == vip:
+                session.last_reply_vip = None
+            if session.vip_locked == vip:
+                session.vip_locked = None
+            if session.vip_src == vip:
+                session.vip_src = None
         for key, value in list(self.icmp_echo_map.items()):
             if value[0] == vip:
                 self.icmp_echo_map.pop(key, None)
@@ -1185,14 +1184,8 @@ class MovingTargetDefense(app_manager.RyuApp):
         # Initialize primary VIP on discovery
         if real_ip not in self.primary_vip:
             now = time()
-            vip = self._take_resource_vip(now)
+            vip = self._ensure_primary_vip(real_ip, now)
             if vip:
-                self._bind_vip_to_host(vip, real_ip, now)
-                self.primary_vip[real_ip] = vip
-                self.lingering_vips[real_ip] = set()
-                # Announce VIP to network
-                self._send_gratuitous_arp_to_all(vip)
-                self._send_targeted_arp_updates(vip)
                 self.logger.info("[+] New host %s (%s) - assigned primary VIP: %s", real_ip, mac, vip)
 
     def _send_arp_reply(self, dp, ethertype, dst_mac, src_mac, src_ip, target_mac, target_ip, out_port):
