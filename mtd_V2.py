@@ -110,7 +110,7 @@ class MovingTargetDefense(app_manager.RyuApp):
 
         # ICMP echo tracking so replies map back to the VIP that was contacted
         # even when multiple outstanding requests target different VIPs.
-        self.icmp_echo_map: Dict[Tuple[str, str, int, int], Tuple[str, float]] = {}
+        self.icmp_echo_map: Dict[Tuple[str, str, int], Tuple[str, float]] = {}
 
         # Active session tracking per real host to support dynamic VIP scaling.
         self.host_active_sessions: Dict[str, Set[SessionKey]] = defaultdict(set)
@@ -585,9 +585,8 @@ class MovingTargetDefense(app_manager.RyuApp):
             if (icmp_pkt and getattr(icmp_pkt, "type", None) == 8 and
                     hasattr(icmp_pkt, "data")):
                 echo_id = getattr(icmp_pkt.data, "id", None)
-                echo_seq = getattr(icmp_pkt.data, "seq", None)
-                if echo_id is not None and echo_seq is not None:
-                    key = (server_real, client_real, int(echo_id), int(echo_seq))
+                if echo_id is not None:
+                    key = (server_real, client_real, int(echo_id))
                     self.icmp_echo_map[key] = (vip_dst, now)
             if direction == 'forward' and vip_dst:
                 flow_key = (client_real, server_real, proto, client_port, server_port)
@@ -729,9 +728,8 @@ class MovingTargetDefense(app_manager.RyuApp):
             # Priority 4: For ICMP, check echo map
             elif proto == 1 and icmp_pkt and getattr(icmp_pkt, "type", None) == 0 and hasattr(icmp_pkt, "data"):
                 echo_id = getattr(icmp_pkt.data, "id", None)
-                echo_seq = getattr(icmp_pkt.data, "seq", None)
-                if echo_id is not None and echo_seq is not None:
-                    key = (server_real, client_real, int(echo_id), int(echo_seq))
+                if echo_id is not None:
+                    key = (server_real, client_real, int(echo_id))
                     stored = self.icmp_echo_map.get(key)
                     if stored:
                         candidate_vip, _stored_ts = stored
@@ -817,8 +815,8 @@ class MovingTargetDefense(app_manager.RyuApp):
         dp.send_msg(out)
 
         if new_session:
-            self.logger.info("SESSION: created %s -> %s (proto %d) vip_dst=%s (key=%s)",
-                             src_ip, dst_ip, proto, session.vip_dst, (src_ip, dst_ip))
+            self.logger.info("SESSION: created %s -> %s (proto %d) vip_dst=%s (session_key=%s)",
+                             src_ip, dst_ip, proto, session.vip_dst, session.key)
 
         session.packet_count += 1
         session.last_growth = now
