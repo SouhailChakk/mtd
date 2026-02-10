@@ -5,7 +5,6 @@ per-packet randomized outbound VIP selection, reply VIP locking, and
 comprehensive housekeeping.
 """
 
-import random
 from dataclasses import dataclass, field
 from time import time
 from typing import Dict, List, Optional, Set, Tuple
@@ -689,9 +688,8 @@ class MovingTargetDefense(app_manager.RyuApp):
                     session.last_vip_src_announce = now
 
             if not session.vip_src:
-                pool = list(self.host_vip_pools[client_real])
-                if pool:
-                    vip_src = random.choice(pool)
+                vip_src = self.primary_vip.get(client_real)
+                if vip_src and self.V2R_Mappings.get(vip_src) == client_real:
                     session.vip_src = vip_src
                     session.active_target_vip = vip_dst
                     if vip_dst:
@@ -901,27 +899,18 @@ class MovingTargetDefense(app_manager.RyuApp):
                         self.icmp_echo_map.pop(key, None)
 
     def _choose_outbound_vip(self, real_ip: str, now: float) -> Optional[str]:
+        # Keep source identity stable: prefer current primary VIP only.
+        current_primary = self.primary_vip.get(real_ip)
+        if current_primary and self.V2R_Mappings.get(current_primary) == real_ip:
+            return current_primary
+
+        # Fallback only if primary is missing/inconsistent.
         pool = self.host_vip_pools.get(real_ip)
         if not pool:
             return None
-        primary: List[str] = []
-        cooling: List[str] = []
-        fallback: List[str] = []
         for vip in pool:
-            fallback.append(vip)
-            if self.vip_sessions[vip] > 0:
-                continue
-            last_used = self.vip_recently_used.get(vip, 0.0)
-            if (now - last_used) < self.VIP_REUSE_COOLDOWN:
-                cooling.append(vip)
-                continue
-            primary.append(vip)
-        if primary:
-            return random.choice(primary)
-        if cooling:
-            return random.choice(cooling)
-        if fallback:
-            return random.choice(fallback)
+            if self.V2R_Mappings.get(vip) == real_ip:
+                return vip
         return None
 
     def _compose_reply_key(self, server_real: str, client_real: str,
