@@ -895,9 +895,10 @@ class MovingTargetDefense(app_manager.RyuApp):
 
         if session.proto == 1:
             for key in list(self.icmp_echo_map.keys()):
-                server_real, client_real, _, _ = key
-                if server_real == session.key[1] and client_real == session.key[0]:
-                    self.icmp_echo_map.pop(key, None)
+                if len(key) >= 2:
+                    server_real, client_real = key[0], key[1]
+                    if server_real == session.key[1] and client_real == session.key[0]:
+                        self.icmp_echo_map.pop(key, None)
 
     def _choose_outbound_vip(self, real_ip: str, now: float) -> Optional[str]:
         pool = self.host_vip_pools.get(real_ip)
