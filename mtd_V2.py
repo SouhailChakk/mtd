@@ -1,49 +1,26 @@
 """
-Moving Target Defense Ryu controller with dynamic VIP rotation and reply locking.
-Rewritten from scratch to preserve legacy logging semantics while adding
-per-packet randomized outbound VIP selection, reply VIP locking, and
-comprehensive housekeeping.
+Simplified Moving Target Defense Ryu controller.
+
+Design goals:
+- Simple time-based VIP rotation only.
+- VIP state machine: PRIMARY -> GRACE -> RECLAIMED (time driven).
+- No session table / refcount / stats growth logic.
+- Straightforward flow installs visible in OVS:
+  * ip,nw_dst=<vip> rewrite to real host
+  * ip,nw_src=<real> rewrite to host VIP
+- Keep table-miss to controller and ARP VIP replies.
 """
 
 from dataclasses import dataclass, field
 from time import time
-from typing import Dict, List, Optional, Set, Tuple
-from collections import defaultdict
+from typing import Dict, List, Optional, Set
 
 from ryu.base import app_manager
 from ryu.controller import event, ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
 from ryu.lib import hub
-from ryu.lib.packet import arp, ethernet, icmp, ipv4, packet, tcp, udp
+from ryu.lib.packet import arp, ethernet, ipv4, packet, tcp, udp
 from ryu.ofproto import ofproto_v1_3
-
-
-SessionKey = Tuple[str, str, int, int, int]
-
-
-@dataclass
-class SessionRecord:
-    key: SessionKey
-    datapath: "ryu.controller.controller.Datapath"
-    created: float
-    last_growth: float
-    packet_count: int = 0
-    last_reported_count: int = 0
-    vip_src: Optional[str] = None
-    vip_dst: Optional[str] = None
-    vip_locked: Optional[str] = None
-    last_reply_vip: Optional[str] = None
-    last_contacted_vip: Optional[str] = None
-    last_vip_src_use: float = 0.0
-    last_vip_src_announce: float = 0.0
-    active_target_vip: Optional[str] = None
-    vip_src_by_target: Dict[str, str] = field(default_factory=dict)
-    src_ip_initial: str = ""
-    dst_ip_initial: str = ""
-    reverse_src_initial: str = ""
-    reverse_dst_initial: str = ""
-    proto: int = 0
-    reply_keys: Set[Tuple] = field(default_factory=set)
 
 
 class EventMessage(event.EventBase):
@@ -74,25 +51,23 @@ class MovingTargetDefense(app_manager.RyuApp):
     # Cookie-based flow tracking
     COOKIE_BASE = 0xA000_0000_0000_0000
     COOKIE_VIP_MASK = 0xFFFF_FFFF
-    # ==================================================
+
+    VIP_STATE_PRIMARY = "PRIMARY"
+    VIP_STATE_GRACE = "GRACE"
+    VIP_STATE_RECLAIMED = "RECLAIMED"
 
     def __init__(self, *args, **kwargs):
         super(MovingTargetDefense, self).__init__(*args, **kwargs)
 
-        # dataplanes & L2 learn
         self.mac_to_port: Dict[int, Dict[str, int]] = {}
         self.datapaths: Set["ryu.controller.controller.Datapath"] = set()
 
-        # hosts (real)
         self.detected_hosts: Set[str] = set()
-        self.HostAttachments: Dict[str, int] = {}
         self.host_ip_to_mac: Dict[str, str] = {}
-        # host_mac_to_ip can be derived from host_ip_to_mac, but kept for reverse lookup speed
-        self.host_mac_to_ip: Dict[str, str] = {}
-
-        # VIP state - consolidated to reduce redundancy
-        self.V2R_Mappings: Dict[str, str] = {}  # VIP -> real_ip (also serves as vip_owner)
-        self.host_vip_pools: Dict[str, Set[str]] = defaultdict(set)
+        self.primary_vip: Dict[str, str] = {}
+        self.vip_owner: Dict[str, str] = {}
+        self.vip_state: Dict[str, str] = {}
+        self.vip_grace_until: Dict[str, float] = {}
         self.vip_mac_map: Dict[str, str] = {}
         self.vip_created_at: Dict[str, float] = {}  # Also used as vip_birth
         self.vip_last_seen: Dict[str, float] = {}  # Primary timestamp (vip_last_activity merged)
@@ -124,10 +99,6 @@ class MovingTargetDefense(app_manager.RyuApp):
         # VIP resource pool
         self.Resources: List[str] = self._generate_vips(self.VIP_POOL_START, self.NUM_VIPS)
 
-        # sessions: session_table[key] -> SessionRecord
-        self.session_table: Dict[SessionKey, SessionRecord] = {}
-
-    # ---------------- lifecycle ----------------
     def start(self):
         super(MovingTargetDefense, self).start()
         self.threads.append(hub.spawn(self._ticker))
@@ -135,13 +106,9 @@ class MovingTargetDefense(app_manager.RyuApp):
 
     def _ticker(self):
         while True:
-            try:
-                self.send_event_to_observers(EventMessage("TICK"))
-            except Exception as e:  # pragma: no cover - defensive log
-                self.logger.error("Ticker exception: %s", e)
+            self.send_event_to_observers(EventMessage("TICK"))
             hub.sleep(self.HOUSEKEEPING_INTERVAL)
 
-    # ---------------- utils ----------------
     def _generate_vips(self, start_ip: str, count: int) -> List[str]:
         base = list(map(int, start_ip.split('.')))
         out: List[str] = []
@@ -182,9 +149,8 @@ class MovingTargetDefense(app_manager.RyuApp):
             self.vip_grace_since.pop(vip, None)
         self.logger.info("VIP STATE: %s %s -> %s (%s)", vip, old_state or "<new>", state, reason or "no-reason")
 
-    def _mark_vip_reuse(self, vip: str, ts: float) -> None:
-        if vip:
-            self.vip_recently_used[vip] = ts
+    def _vip_cookie(self, vip: str) -> int:
+        return self.COOKIE_BASE | (self._ip_to_int(vip) & self.COOKIE_VIP_MASK)
 
     def _on_session_start(self, vip: str) -> None:
         """Called when a new session is established to destination VIP."""
@@ -288,10 +254,91 @@ class MovingTargetDefense(app_manager.RyuApp):
 
         return echo_id & 0xFFFF, echo_seq_i
 
-    # Removed: _flag_vip_idle and _start_idle_timer
-    # Primary VIP rotation uses immediate reclaim based on session count, not idle timers
+    def _take_resource_vip(self) -> Optional[str]:
+        if not self.Resources:
+            return None
+        return self.Resources.pop(0)
 
-    # ---------------- switch bringup ----------------
+    def _bind_primary_vip(self, host_ip: str, vip: str, now: float):
+        self.vip_owner[vip] = host_ip
+        self.primary_vip[host_ip] = vip
+        self.vip_mac_map[vip] = self._generate_vip_mac(vip)
+        self._set_vip_state(vip, self.VIP_STATE_PRIMARY, now, "bind primary")
+
+    def _build_ip_match(self, parser, in_port: int, src_ip: str, dst_ip: str,
+                        proto: int, src_port: int, dst_port: int):
+        match_kwargs = {
+            "in_port": in_port,
+            "eth_type": 0x0800,
+            "ipv4_src": src_ip,
+            "ipv4_dst": dst_ip,
+            "ip_proto": proto,
+        }
+        if proto == 6:
+            match_kwargs.update(tcp_src=src_port, tcp_dst=dst_port)
+        elif proto == 17:
+            match_kwargs.update(udp_src=src_port, udp_dst=dst_port)
+        return parser.OFPMatch(**match_kwargs)
+
+    def _add_flow(self, dp, priority, match, actions, cookie=0, table_id=0,
+                  hard_timeout=0, idle_timeout=30):
+        parser = dp.ofproto_parser
+        ofp = dp.ofproto
+        inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+        mod = parser.OFPFlowMod(
+            datapath=dp,
+            table_id=table_id,
+            priority=priority,
+            cookie=cookie,
+            cookie_mask=0,
+            match=match,
+            instructions=inst,
+            hard_timeout=hard_timeout,
+            idle_timeout=idle_timeout,
+        )
+        self.logger.info(
+            "FLOW ADD: dp=%016x table=%d prio=%d cookie=0x%016x match=%s actions=%s idle=%d hard=%d",
+            dp.id, table_id, priority, cookie, match, actions, idle_timeout, hard_timeout,
+        )
+        dp.send_msg(mod)
+
+    def _delete_flow(self, dp, match=None, cookie=0, cookie_mask=0, table_id=None):
+        parser = dp.ofproto_parser
+        ofp = dp.ofproto
+        if table_id is None:
+            table_id = ofp.OFPTT_ALL
+        if match is None:
+            match = parser.OFPMatch()
+        mod = parser.OFPFlowMod(
+            datapath=dp,
+            table_id=table_id,
+            command=ofp.OFPFC_DELETE,
+            out_port=ofp.OFPP_ANY,
+            out_group=ofp.OFPG_ANY,
+            cookie=cookie,
+            cookie_mask=cookie_mask,
+            match=match,
+        )
+        self.logger.info(
+            "FLOW DEL: dp=%016x table=%s cmd=%s cookie=0x%016x mask=0x%016x match=%s out_port=ANY out_group=ANY",
+            dp.id,
+            "ALL" if table_id == ofp.OFPTT_ALL else table_id,
+            "DELETE",
+            cookie,
+            cookie_mask,
+            match,
+            )
+        dp.send_msg(mod)
+
+    def _purge_flows_for_vip(self, vip: str):
+        cookie = self._vip_cookie(vip)
+        for dp in list(self.datapaths):
+            parser = dp.ofproto_parser
+            self._delete_flow(dp, cookie=cookie, cookie_mask=0xFFFF_FFFF_FFFF_FFFF, table_id=dp.ofproto.OFPTT_ALL)
+            self._delete_flow(dp, match=parser.OFPMatch(eth_type=0x0800, ipv4_dst=vip), table_id=dp.ofproto.OFPTT_ALL)
+            self._delete_flow(dp, match=parser.OFPMatch(eth_type=0x0800, ipv4_src=vip), table_id=dp.ofproto.OFPTT_ALL)
+        self.logger.info("FLOW: purged VIP %s using cookie+match deletes", vip)
+
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         dp = ev.msg.datapath
@@ -300,61 +347,21 @@ class MovingTargetDefense(app_manager.RyuApp):
         ofp = dp.ofproto
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
-        self._add_flow(dp, priority=0, match=match, actions=actions)
+        self._add_flow(dp, priority=0, match=match, actions=actions, table_id=0, idle_timeout=0)
         self.logger.info("[SW] Switch %016x connected; installed table-miss", dp.id)
 
-    def _add_flow(self, dp, priority, match, actions, buffer_id=None, hard_timeout=0, idle_timeout=60):
-        parser = dp.ofproto_parser
-        ofp = dp.ofproto
-        inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
-        if buffer_id is not None:
-            mod = parser.OFPFlowMod(datapath=dp,
-                                    buffer_id=buffer_id,
-                                    priority=priority,
-                                    match=match,
-                                    instructions=inst,
-                                    hard_timeout=hard_timeout,
-                                    idle_timeout=idle_timeout)
-        else:
-            mod = parser.OFPFlowMod(datapath=dp,
-                                    priority=priority,
-                                    match=match,
-                                    instructions=inst,
-                                    hard_timeout=hard_timeout,
-                                    idle_timeout=idle_timeout)
-        dp.send_msg(mod)
-
-    # ---------------- housekeeping ----------------
     @set_ev_cls(EventMessage)
     def _housekeeping(self, _):
         now = time()
-
-        # 1) poll sessions via virtual growth accounting
-        total = 0
-        for session_key, session in list(self.session_table.items()):
-            total += 1
-            if session.packet_count > session.last_reported_count:
-                delta = session.packet_count - session.last_reported_count
-                session.last_reported_count = session.packet_count
-                session.last_growth = now
-                src_ip = session.src_ip_initial or session.key[0]
-                dst_ip = session.dst_ip_initial or session.key[1]
-                self.logger.info("STATS: growth %s -> %s (+%d) pkts=%d",
-                                 src_ip, dst_ip, delta, session.packet_count)
-                if session.vip_dst:
-                    self._touch_vip(session.vip_dst, now, "stats growth: vip_dst")
-                if session.vip_src:
-                    self._touch_vip(session.vip_src, now, "stats growth: vip_src")
+        for vip, state in list(self.vip_state.items()):
+            if state != self.VIP_STATE_GRACE:
+                continue
+            grace_until = self.vip_grace_until.get(vip, 0.0)
+            if now >= grace_until:
+                self.logger.info("RECLAIM CHECK: vip=%s state=GRACE now=%.3f grace_until=%.3f -> reclaim", vip, now, grace_until)
+                self._reclaim_vip(vip, now, "grace timeout")
             else:
-                age = now - session.last_growth
-                if age > self.SESSION_NO_GROWTH_TIMEOUT:
-                    src_ip = session.src_ip_initial or session.key[0]
-                    dst_ip = session.dst_ip_initial or session.key[1]
-                    self.logger.info("SESSION: drop %s -> %s (%.1fs no growth)",
-                                     src_ip, dst_ip, age)
-                    self._finalize_session(session_key, now, reason="session drop")
-
-        self.logger.info("STATS: polled %d sessions", total)
+                self.logger.info("RECLAIM CHECK: vip=%s state=GRACE now=%.3f grace_until=%.3f -> keep", vip, now, grace_until)
 
         # 2) evaluate reclaim for GRACE VIPs
         for host_ip, grace_vips in list(self.lingering_vips.items()):
@@ -439,22 +446,14 @@ class MovingTargetDefense(app_manager.RyuApp):
         """Periodically rotate primary VIPs for each host (every 60s)."""
         while True:
             hub.sleep(self.ROTATE_INTERVAL)
-            self.last_rotate_ts = time()
             now = time()
-            
             for host_ip in sorted(self.detected_hosts):
                 old_vip = self.primary_vip.get(host_ip)
-                
-                # 1) Always assign new primary VIP (every 60s)
-                new_vip = self._take_resource_vip(now)
+                new_vip = self._take_resource_vip()
                 if not new_vip:
-                    self.logger.warning("ROTATE: No VIP available for %s", host_ip)
+                    self.logger.warning("ROTATE: no VIP available for %s", host_ip)
                     continue
-                
-                self._bind_vip_to_host(new_vip, host_ip, now)
-                self.primary_vip[host_ip] = new_vip
-                
-                # Announce new primary VIP to network
+                self._bind_primary_vip(host_ip, new_vip, now)
                 self._send_gratuitous_arp_to_all(new_vip)
                 self._send_targeted_arp_updates(new_vip)
                 
@@ -466,60 +465,36 @@ class MovingTargetDefense(app_manager.RyuApp):
                     # Keep flows installed for GRACE VIP; reclaim is deferred.
                     self._maybe_reclaim_vip(old_vip, now, reason="rotation checkpoint")
 
-    # ---------------- packet-in ----------------
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in(self, ev):
         msg = ev.msg
         dp = msg.datapath
-        ofp = dp.ofproto
         parser = dp.ofproto_parser
+        ofp = dp.ofproto
         in_port = msg.match['in_port']
+        dpid = dp.id
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
         if not eth:
             return
 
-        dpid = dp.id
         self.mac_to_port.setdefault(dpid, {})
         self.mac_to_port[dpid][eth.src] = in_port
 
-        # learn hosts early
-        self._learn_host(pkt, dpid)
+        self._learn_host(pkt)
 
-        actions: List = []
-        out_port = ofp.OFPP_FLOOD
-        forward_dst_mac: Optional[str] = None
-
-        # ---- ARP ----
         a = pkt.get_protocol(arp.arp)
         if a and a.opcode == arp.ARP_REQUEST:
-            dip, sip, smac = a.dst_ip, a.src_ip, a.src_mac
+            self._handle_arp_request(dp, eth, a, in_port)
+            return
 
-            # For primary VIP rotation: don't lazy-assign VIPs
-            # VIPs are only assigned by rotation loop or on host discovery
-            # Lazy assignment disabled to maintain exactly one primary VIP per host
-
-            if dip in self.V2R_Mappings:
-                mac = self.vip_mac_map.get(dip) or self._generate_vip_mac(dip)
-                self.vip_mac_map[dip] = mac
-                self._send_arp_reply(dp, eth.ethertype, eth.src, mac, dip, smac, sip, in_port)
-                self.logger.info("ARP: replied VIP %s -> %s", dip, mac)
-                return
-            if dip in self.host_ip_to_mac:
-                mac = self.host_ip_to_mac[dip]
-                self._send_arp_reply(dp, eth.ethertype, eth.src, mac, dip, smac, sip, in_port)
-                self.logger.info("ARP: replied real %s -> %s", dip, mac)
-                return
-
-        # ---- IPv4 ----
         ip4 = pkt.get_protocol(ipv4.ipv4)
         if not ip4:
             return
 
         tcp_pkt = pkt.get_protocol(tcp.tcp)
         udp_pkt = pkt.get_protocol(udp.udp)
-        icmp_pkt = pkt.get_protocol(icmp.icmp)
 
         src_ip, dst_ip, proto = ip4.src, ip4.dst, ip4.proto
         src_port = tcp_pkt.src_port if tcp_pkt else (udp_pkt.src_port if udp_pkt else 0)
@@ -540,27 +515,14 @@ class MovingTargetDefense(app_manager.RyuApp):
         now = time()
         # self.logger.info("PACKET: %s -> %s (proto %d)", src_ip, dst_ip, proto)
 
-        direction, session_key, client_real, server_real, client_port, server_port = \
-            self._classify_flow(src_ip, dst_ip, proto, src_port, dst_port)
+        src_real = self.vip_owner.get(src_ip, src_ip)
+        dst_real = self.vip_owner.get(dst_ip, dst_ip)
 
-        session = self.session_table.get(session_key)
-        new_session = False
-        if not session:
-            session = self._create_session_record(session_key, dp, now,
-                                                   src_ip, dst_ip, proto)
-            self.session_table[session_key] = session
-            new_session = True
-            affected_hosts: Set[str] = set()
-            for host in (server_real, client_real):
-                if host not in self.detected_hosts:
-                    continue
-                host_sessions = self.host_active_sessions[host]
-                host_sessions.add(session_key)
-                affected_hosts.add(host)
-            # Primary VIP rotation handles VIP assignment, no dynamic scaling on session creation
-            # for host in affected_hosts:
-            #     self._rebalance_host_vips(host, now)
+        actions = []
+        out_port = ofp.OFPP_FLOOD
+        flow_cookie = 0
 
+        # Forward: dst is VIP or known host -> rewrite to real destination
         vip_dst = None
         forward_dst_mac = None
 
@@ -618,12 +580,12 @@ class MovingTargetDefense(app_manager.RyuApp):
                 vip_dst = session.vip_dst
                 real_dst = self.V2R_Mappings.get(vip_dst, server_real)
         else:
-            # External destination
             real_dst = dst_ip
-        
+
         if vip_dst:
-            actions.append(parser.OFPActionSetField(ipv4_dst=real_dst))
+            flow_cookie = self._vip_cookie(vip_dst)
             dst_mac = self.host_ip_to_mac.get(real_dst)
+            actions.append(parser.OFPActionSetField(ipv4_dst=real_dst))
             if dst_mac:
                 actions.append(parser.OFPActionSetField(eth_dst=dst_mac))
                 forward_dst_mac = dst_mac
@@ -817,60 +779,32 @@ class MovingTargetDefense(app_manager.RyuApp):
                 mac = self.vip_mac_map.get(vip_src) or self._generate_vip_mac(vip_src)
                 self.vip_mac_map[vip_src] = mac
                 actions.append(parser.OFPActionSetField(ipv4_src=vip_src))
-                actions.append(parser.OFPActionSetField(eth_src=mac))
-                session.last_reply_vip = vip_src
-                self._mark_vip_reuse(vip_src, now)
-                key = self._compose_reply_key(server_real, client_real, proto,
-                                               client_port, server_port)
-                previous = self._reply_vip_by_5tuple.get(key)
-                if previous != vip_src:
-                    self._reply_vip_by_5tuple[key] = vip_src
-                    session.reply_keys.add(key)
-                    self.reply_vip_pair[(server_real, client_real, proto)] = vip_src
-                    if proto == 1:
-                        self.logger.info("REPLY OVERRIDE (ICMP): Using %s for %s->%s (client=%s)",
-                                         vip_src, server_real, client_real, client_real)
-                    else:
-                        self.logger.info("REPLY OVERRIDE: Using %s for %s->%s proto=%d",
-                                         vip_src, server_real, client_real, proto)
-                self._send_targeted_arp_to_host_for_vip(vip_src, client_real)
-            client_mac = self.host_ip_to_mac.get(client_real)
-            if client_mac:
-                actions.append(parser.OFPActionSetField(eth_dst=client_mac))
-                forward_dst_mac = client_mac
-            if dst_ip in self.V2R_Mappings:
-                real_dst = self.V2R_Mappings[dst_ip]
-            elif dst_ip in self.V2R_Mappings:
-                # Check if it's a lingering VIP (V2R_Mappings also serves as vip_owner)
-                owner = self.V2R_Mappings.get(dst_ip)
-                if owner and dst_ip in self.lingering_vips[owner]:
-                    real_dst = owner
-                else:
-                    real_dst = dst_ip
-            else:
-                real_dst = dst_ip
-            actions.append(parser.OFPActionSetField(ipv4_dst=real_dst))
-            session.reverse_src_initial = src_ip
-            session.reverse_dst_initial = dst_ip
+                actions.append(parser.OFPActionSetField(eth_src=vip_src_mac))
 
         if not actions:
             actions.append(parser.OFPActionOutput(ofp.OFPP_FLOOD))
-            out_port = ofp.OFPP_FLOOD
         else:
-            if forward_dst_mac:
-                out_port = self.mac_to_port.get(dpid, {}).get(forward_dst_mac, ofp.OFPP_FLOOD)
             actions.append(parser.OFPActionOutput(out_port))
 
-        if msg.buffer_id == ofp.OFP_NO_BUFFER:
-            data = msg.data
-        else:
-            data = None
+            if out_port != ofp.OFPP_FLOOD and flow_cookie:
+                match = self._build_ip_match(parser, in_port, src_ip, dst_ip, proto, src_port, dst_port)
+                self._add_flow(dp,
+                               priority=self.FLOW_PRIORITY_VIP,
+                               match=match,
+                               actions=actions[:-1],
+                               table_id=0,
+                               cookie=flow_cookie,
+                               idle_timeout=30,
+                               hard_timeout=0)
 
-        out = parser.OFPPacketOut(datapath=dp,
-                                   buffer_id=msg.buffer_id,
-                                   in_port=in_port,
-                                   actions=actions,
-                                   data=data)
+        data = msg.data if msg.buffer_id == ofp.OFP_NO_BUFFER else None
+        out = parser.OFPPacketOut(
+            datapath=dp,
+            buffer_id=msg.buffer_id,
+            in_port=in_port,
+            actions=actions,
+            data=data,
+        )
         dp.send_msg(out)
 
         if new_session:
@@ -1200,15 +1134,11 @@ class MovingTargetDefense(app_manager.RyuApp):
         arp_pkt = pkt.get_protocol(arp.arp)
         ip_pkt = pkt.get_protocol(ipv4.ipv4)
 
-        real_ip, mac = None, None
         if arp_pkt:
             real_ip, mac = arp_pkt.src_ip, arp_pkt.src_mac
         elif ip_pkt:
             real_ip, mac = ip_pkt.src, (eth_pkt.src if eth_pkt else None)
         else:
-            return
-
-        if real_ip in self.V2R_Mappings:
             return
 
         try:
@@ -1220,20 +1150,10 @@ class MovingTargetDefense(app_manager.RyuApp):
         except Exception:
             return
 
-        if real_ip in self.detected_hosts:
-            if mac:
-                self.host_ip_to_mac[real_ip] = mac
-                self.host_mac_to_ip[mac] = real_ip
-                self.HostAttachments[real_ip] = dpid
-            return
-
         self.detected_hosts.add(real_ip)
         if mac:
             self.host_ip_to_mac[real_ip] = mac
-            self.host_mac_to_ip[mac] = real_ip
-            self.HostAttachments[real_ip] = dpid
 
-        # Initialize primary VIP on discovery
         if real_ip not in self.primary_vip:
             now = time()
             vip = self._ensure_primary_vip(real_ip, now)
@@ -1254,9 +1174,10 @@ class MovingTargetDefense(app_manager.RyuApp):
             buffer_id=ofp.OFP_NO_BUFFER,
             in_port=ofp.OFPP_CONTROLLER,
             actions=[parser.OFPActionOutput(out_port)],
-            data=p.data))
+            data=p.data,
+        ))
 
-    def _proactive_discovery(self, now: float) -> None:
+    def _send_gratuitous_arp_to_all(self, vip: str):
         if not self.datapaths:
             return
         if not hasattr(self, "_last_discovery"):
