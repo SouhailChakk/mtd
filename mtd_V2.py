@@ -179,6 +179,7 @@ class MovingTargetDefense(app_manager.RyuApp):
             if (ts - last_log) >= self.VIP_TOUCH_LOG_INTERVAL:
                 self.vip_touch_log_ts[vip] = ts
                 self.logger.info("VIP TOUCH: %s last_seen=%.3f (%s)", vip, ts, reason)
+            self.logger.info("VIP TOUCH: %s last_seen=%.3f (%s)", vip, ts, reason)
 
     def _set_vip_state(self, vip: str, state: str, ts: float, reason: str = "") -> None:
         old_state = self.vip_state.get(vip)
