@@ -179,13 +179,13 @@ class MovingTargetDefense(app_manager.RyuApp):
         parser = dp.ofproto_parser
         ofp = dp.ofproto
         in_port = msg.match['in_port']
+        dpid = dp.id
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
         if not eth:
             return
 
-        dpid = dp.id
         self.mac_to_port.setdefault(dpid, {})
         self.mac_to_port[dpid][eth.src] = in_port
 
