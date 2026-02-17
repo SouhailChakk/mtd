@@ -70,13 +70,10 @@ class MovingTargetDefense(app_manager.RyuApp):
     VIP_STATE_PRIMARY = "PRIMARY"
     VIP_STATE_GRACE = "GRACE"
     VIP_STATE_RECLAIMED = "RECLAIMED"
-    VIP_TOUCH_LOG_INTERVAL = 1.0     # seconds between VIP TOUCH logs per VIP
-    ARP_JIT_MIN_INTERVAL = 3.0        # seconds between targeted JIT ARP per (vip,target)
     
     # Cookie-based flow tracking
     COOKIE_BASE = 0xA000_0000_0000_0000
     COOKIE_VIP_MASK = 0xFFFF_FFFF
-    FLOW_PRIORITY_VIP = 100
     # ==================================================
 
     def __init__(self, *args, **kwargs):
@@ -110,8 +107,6 @@ class MovingTargetDefense(app_manager.RyuApp):
         self.lingering_vips: Dict[str, Set[str]] = defaultdict(set)  # old primaries kept while active
         self.vip_state: Dict[str, str] = {}
         self.vip_grace_since: Dict[str, float] = {}
-        self.vip_touch_log_ts: Dict[str, float] = {}
-        self.arp_jit_last_sent: Dict[Tuple[str, str], float] = {}
         self.last_rotate_ts: float = time()
 
         # reply VIP binding (legacy logging expectations)
@@ -176,10 +171,6 @@ class MovingTargetDefense(app_manager.RyuApp):
         if vip not in self.vip_ever_active:
             self.vip_ever_active[vip] = ts
         if reason:
-            last_log = self.vip_touch_log_ts.get(vip, 0.0)
-            if (ts - last_log) >= self.VIP_TOUCH_LOG_INTERVAL:
-                self.vip_touch_log_ts[vip] = ts
-                self.logger.info("VIP TOUCH: %s last_seen=%.3f (%s)", vip, ts, reason)
             self.logger.info("VIP TOUCH: %s last_seen=%.3f (%s)", vip, ts, reason)
 
     def _set_vip_state(self, vip: str, state: str, ts: float, reason: str = "") -> None:
@@ -297,102 +288,6 @@ class MovingTargetDefense(app_manager.RyuApp):
 
         return echo_id & 0xFFFF, echo_seq_i
 
-    def _handle_icmp_no_session(self, dp, parser, ofp, msg, in_port, dpid,
-                                src_ip: str, dst_ip: str, icmp_pkt, now: float) -> None:
-        """Handle ICMP as activity-only traffic (no session_table entry)."""
-        echo_id, _echo_seq = self._extract_icmp_echo_fields(icmp_pkt)
-        src_real = self.V2R_Mappings.get(src_ip, src_ip)
-        dst_real = self.V2R_Mappings.get(dst_ip, dst_ip)
-        icmp_type = getattr(icmp_pkt, "type", None)
-
-        actions: List = []
-        forward_dst_mac: Optional[str] = None
-
-        if icmp_type == 8:  # echo request: client -> server
-            client_real, server_real = src_real, dst_real
-            if dst_ip in self.V2R_Mappings:
-                vip_dst = dst_ip
-                real_dst = self.V2R_Mappings[dst_ip]
-            elif server_real in self.detected_hosts:
-                vip_dst = self._ensure_primary_vip(server_real, now)
-                real_dst = server_real
-            else:
-                vip_dst = None
-                real_dst = dst_ip
-
-            if vip_dst:
-                actions.append(parser.OFPActionSetField(ipv4_dst=real_dst))
-                self._touch_vip(vip_dst, now, "icmp request: vip_dst")
-                if echo_id is not None:
-                    self.icmp_echo_map[(server_real, client_real, int(echo_id))] = (vip_dst, now)
-
-            vip_src = self.primary_vip.get(client_real)
-            if vip_src and self.V2R_Mappings.get(vip_src) == client_real:
-                mac = self.vip_mac_map.get(vip_src) or self._generate_vip_mac(vip_src)
-                self.vip_mac_map[vip_src] = mac
-                actions.append(parser.OFPActionSetField(ipv4_src=vip_src))
-                actions.append(parser.OFPActionSetField(eth_src=mac))
-                self._touch_vip(vip_src, now, "icmp request: vip_src")
-                self._send_targeted_arp_to_host_for_vip(vip_src, server_real)
-
-            dst_mac = self.host_ip_to_mac.get(real_dst)
-            if dst_mac:
-                actions.append(parser.OFPActionSetField(eth_dst=dst_mac))
-                forward_dst_mac = dst_mac
-
-        elif icmp_type == 0:  # echo reply: server -> client
-            server_real, client_real = src_real, dst_real
-            vip_src = None
-            if echo_id is not None:
-                stored = self.icmp_echo_map.get((server_real, client_real, int(echo_id)))
-                if stored and self.V2R_Mappings.get(stored[0]) == server_real:
-                    vip_src = stored[0]
-
-            if not vip_src:
-                for candidate in self.lingering_vips.get(server_real, set()):
-                    if self.V2R_Mappings.get(candidate) == server_real:
-                        vip_src = candidate
-                        break
-            if not vip_src:
-                vip_src = self.primary_vip.get(server_real)
-
-            if vip_src:
-                mac = self.vip_mac_map.get(vip_src) or self._generate_vip_mac(vip_src)
-                self.vip_mac_map[vip_src] = mac
-                actions.append(parser.OFPActionSetField(ipv4_src=vip_src))
-                actions.append(parser.OFPActionSetField(eth_src=mac))
-                self._touch_vip(vip_src, now, "icmp reply: vip_src")
-                self._send_targeted_arp_to_host_for_vip(vip_src, client_real)
-
-            actions.append(parser.OFPActionSetField(ipv4_dst=client_real))
-            client_mac = self.host_ip_to_mac.get(client_real)
-            if client_mac:
-                actions.append(parser.OFPActionSetField(eth_dst=client_mac))
-                forward_dst_mac = client_mac
-
-        if not actions:
-            actions.append(parser.OFPActionOutput(ofp.OFPP_FLOOD))
-            out_port = ofp.OFPP_FLOOD
-        else:
-            out_port = self.mac_to_port.get(dpid, {}).get(forward_dst_mac, ofp.OFPP_FLOOD) if forward_dst_mac else ofp.OFPP_FLOOD
-            actions.append(parser.OFPActionOutput(out_port))
-
-        vip_for_cookie = None
-        if icmp_type == 8 and dst_ip in self.V2R_Mappings:
-            vip_for_cookie = dst_ip
-        elif icmp_type == 0 and src_ip in self.V2R_Mappings:
-            vip_for_cookie = src_ip
-        if out_port != ofp.OFPP_FLOOD and vip_for_cookie:
-            self._install_vip_flow(dp, in_port, src_ip, dst_ip, 1, 0, 0,
-                                   actions[:-1], self._vip_cookie(vip_for_cookie))
-
-        out = parser.OFPPacketOut(datapath=dp,
-                                  buffer_id=msg.buffer_id,
-                                  in_port=in_port,
-                                  actions=actions,
-                                  data=(msg.data if msg.buffer_id == ofp.OFP_NO_BUFFER else None))
-        dp.send_msg(out)
-
     # Removed: _flag_vip_idle and _start_idle_timer
     # Primary VIP rotation uses immediate reclaim based on session count, not idle timers
 
@@ -408,62 +303,26 @@ class MovingTargetDefense(app_manager.RyuApp):
         self._add_flow(dp, priority=0, match=match, actions=actions)
         self.logger.info("[SW] Switch %016x connected; installed table-miss", dp.id)
 
-    def _add_flow(self, dp, priority, match, actions, buffer_id=None, hard_timeout=0,
-                  idle_timeout=60, cookie=0, cookie_mask=0, table_id=0):
+    def _add_flow(self, dp, priority, match, actions, buffer_id=None, hard_timeout=0, idle_timeout=60):
         parser = dp.ofproto_parser
         ofp = dp.ofproto
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
         if buffer_id is not None:
             mod = parser.OFPFlowMod(datapath=dp,
                                     buffer_id=buffer_id,
-                                    table_id=table_id,
                                     priority=priority,
-                                    cookie=cookie,
-                                    cookie_mask=cookie_mask,
                                     match=match,
                                     instructions=inst,
                                     hard_timeout=hard_timeout,
                                     idle_timeout=idle_timeout)
         else:
             mod = parser.OFPFlowMod(datapath=dp,
-                                    table_id=table_id,
                                     priority=priority,
-                                    cookie=cookie,
-                                    cookie_mask=cookie_mask,
                                     match=match,
                                     instructions=inst,
                                     hard_timeout=hard_timeout,
                                     idle_timeout=idle_timeout)
-        self.logger.info("FLOW ADD: dp=%016x table=%d prio=%d cookie=0x%016x match=%s actions=%s idle=%d hard=%d",
-                         dp.id, table_id, priority, cookie, match, actions, idle_timeout, hard_timeout)
         dp.send_msg(mod)
-
-    def _vip_cookie(self, vip: str) -> int:
-        return self.COOKIE_BASE | (self._ip_to_int(vip) & self.COOKIE_VIP_MASK)
-
-    def _install_vip_flow(self, dp, in_port: int, src_ip: str, dst_ip: str, proto: int,
-                          src_port: int, dst_port: int, actions, vip_cookie: int) -> None:
-        parser = dp.ofproto_parser
-        match_kwargs = {
-            "in_port": in_port,
-            "eth_type": 0x0800,
-            "ipv4_src": src_ip,
-            "ipv4_dst": dst_ip,
-            "ip_proto": proto,
-        }
-        if proto == 6:
-            match_kwargs.update(tcp_src=src_port, tcp_dst=dst_port)
-        elif proto == 17:
-            match_kwargs.update(udp_src=src_port, udp_dst=dst_port)
-        match = parser.OFPMatch(**match_kwargs)
-        self._add_flow(dp,
-                       priority=self.FLOW_PRIORITY_VIP,
-                       match=match,
-                       actions=actions,
-                       hard_timeout=0,
-                       idle_timeout=30,
-                       cookie=vip_cookie,
-                       table_id=0)
 
     # ---------------- housekeeping ----------------
     @set_ev_cls(EventMessage)
@@ -574,8 +433,6 @@ class MovingTargetDefense(app_manager.RyuApp):
             cookie=cookie,
             cookie_mask=cookie_mask,
         )
-        self.logger.info("FLOW DEL COOKIE: dp=%016x table=ALL cookie=0x%016x mask=0x%016x out_port=ANY out_group=ANY",
-                         datapath.id, cookie, cookie_mask)
         datapath.send_msg(mod)
     
     def _rotation_loop(self) -> None:
@@ -682,11 +539,6 @@ class MovingTargetDefense(app_manager.RyuApp):
                 dst_port = 0
         now = time()
         # self.logger.info("PACKET: %s -> %s (proto %d)", src_ip, dst_ip, proto)
-
-        if proto == 1 and icmp_pkt:
-            self._handle_icmp_no_session(dp, parser, ofp, msg, in_port, dpid,
-                                         src_ip, dst_ip, icmp_pkt, now)
-            return
 
         direction, session_key, client_real, server_real, client_port, server_port = \
             self._classify_flow(src_ip, dst_ip, proto, src_port, dst_port)
@@ -1009,16 +861,6 @@ class MovingTargetDefense(app_manager.RyuApp):
                 out_port = self.mac_to_port.get(dpid, {}).get(forward_dst_mac, ofp.OFPP_FLOOD)
             actions.append(parser.OFPActionOutput(out_port))
 
-        vip_for_cookie = session.vip_dst or session.vip_src or session.last_reply_vip
-        if not vip_for_cookie:
-            if dst_ip in self.V2R_Mappings:
-                vip_for_cookie = dst_ip
-            elif src_ip in self.V2R_Mappings:
-                vip_for_cookie = src_ip
-        if out_port != ofp.OFPP_FLOOD and vip_for_cookie:
-            self._install_vip_flow(dp, in_port, src_ip, dst_ip, proto, src_port, dst_port,
-                                   actions[:-1], self._vip_cookie(vip_for_cookie))
-
         if msg.buffer_id == ofp.OFP_NO_BUFFER:
             data = msg.data
         else:
@@ -1179,32 +1021,26 @@ class MovingTargetDefense(app_manager.RyuApp):
     #     return None
 
     def _purge_flows_for_vip(self, vip: str) -> None:
-        vip_cookie = self._vip_cookie(vip)
         for dp in list(self.datapaths):
-            self._delete_flows_by_cookie(dp, vip_cookie)
             parser = dp.ofproto_parser
             ofp = dp.ofproto
-            match_dst = parser.OFPMatch(eth_type=0x0800, ipv4_dst=vip)
             mod_dst = parser.OFPFlowMod(
                 datapath=dp,
                 table_id=ofp.OFPTT_ALL,
                 command=ofp.OFPFC_DELETE,
                 out_port=ofp.OFPP_ANY,
                 out_group=ofp.OFPG_ANY,
-                match=match_dst
+                match=parser.OFPMatch(eth_type=0x0800, ipv4_dst=vip)
             )
-            self.logger.info("FLOW DEL MATCH: dp=%016x table=ALL match=%s", dp.id, match_dst)
             dp.send_msg(mod_dst)
-            match_src = parser.OFPMatch(eth_type=0x0800, ipv4_src=vip)
             mod_src = parser.OFPFlowMod(
                 datapath=dp,
                 table_id=ofp.OFPTT_ALL,
                 command=ofp.OFPFC_DELETE,
                 out_port=ofp.OFPP_ANY,
                 out_group=ofp.OFPG_ANY,
-                match=match_src
+                match=parser.OFPMatch(eth_type=0x0800, ipv4_src=vip)
             )
-            self.logger.info("FLOW DEL MATCH: dp=%016x table=ALL match=%s", dp.id, match_src)
             dp.send_msg(mod_src)
         self.logger.info("FLOW: purged flows for VIP %s (src & dst matches)", vip)
 
@@ -1261,16 +1097,8 @@ class MovingTargetDefense(app_manager.RyuApp):
                     self.logger.debug("Targeted ARP to %s for %s failed: %s", host_ip, vip, e)
         self.logger.info("ARP: targeted updates sent for VIP %s", vip)
 
-    def _send_targeted_arp_to_host_for_vip(self, vip: str, target_real_ip: str, force: bool = False) -> None:
+    def _send_targeted_arp_to_host_for_vip(self, vip: str, target_real_ip: str) -> None:
         try:
-            now = time()
-            cache_key = (vip, target_real_ip)
-            if not force:
-                last_sent = self.arp_jit_last_sent.get(cache_key, 0.0)
-                if (now - last_sent) < self.ARP_JIT_MIN_INTERVAL:
-                    return
-            self.arp_jit_last_sent[cache_key] = now
-
             mac = self.vip_mac_map.get(vip) or self._generate_vip_mac(vip)
             self.vip_mac_map[vip] = mac
             host_mac = self.host_ip_to_mac.get(target_real_ip)
@@ -1334,7 +1162,7 @@ class MovingTargetDefense(app_manager.RyuApp):
         self.vip_grace_since.pop(vip, None)
         
         # Delete flows for this VIP
-        vip_cookie = self._vip_cookie(vip)
+        vip_cookie = self.COOKIE_BASE | (self._ip_to_int(vip) & self.COOKIE_VIP_MASK)
         for datapath in list(self.datapaths):
             self._delete_flows_by_cookie(datapath, vip_cookie)
         
