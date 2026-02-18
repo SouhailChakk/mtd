@@ -538,10 +538,22 @@ class MovingTargetDefense(app_manager.RyuApp):
                     vip_mac = self.vip_mac_map.get(primary_vip)
                     if vip_mac:
                         self._send_arp_reply(
-                            dp, eth.src, vip_mac, primary_vip, arp_pkt.src_ip, in_port
+                            # For ARP requests to a real IP, keep SPA as the requested real IP
+                            # so the requester resolves dst_real in its ARP cache, while exposing
+                            # only the virtual VIP MAC at L2.
+                            dp, eth.src, vip_mac, target_ip, arp_pkt.src_ip, in_port
                         )
-                        self.logger.debug("ARP: replied real %s -> VIP %s", target_ip, primary_vip)
+                        self.logger.debug("ARP: replied real %s with VIP MAC %s", target_ip, vip_mac)
                 return
+
+            # Unknown destination host: do not drop ARP discovery traffic.
+            # Flood request so target can answer and be learned dynamically.
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, ofp.OFPP_FLOOD)
+            return
+
+        # Forward ARP replies/other ARP frames so hosts can complete neighbor resolution.
+        out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+        self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
 
     def _handle_real_to_real(self, msg, dp, pkt, ip4, eth, in_port, dpid, src_real, dst_real):
         """Handle traffic between two real hosts: translate both to VIPs."""
@@ -742,7 +754,9 @@ class MovingTargetDefense(app_manager.RyuApp):
             if src_vip_mac:
                 actions_rev = [
                     parser.OFPActionSetField(ipv4_dst=src_vip),  # Reverse DNAT: real -> VIP
-                    parser.OFPActionSetField(eth_dst=src_vip_mac),
+                    # Packet is delivered to the real host owning src_vip, so L2 dst must be
+                    # that host's MAC (not the VIP virtual MAC) to avoid NIC-level drops.
+                    parser.OFPActionSetField(eth_dst=src_real_mac),
                     parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD))
                 ]
                 self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
@@ -794,7 +808,9 @@ class MovingTargetDefense(app_manager.RyuApp):
                     parser.OFPActionSetField(ipv4_src=dst_vip),  # Reverse SNAT: real -> VIP
                     parser.OFPActionSetField(ipv4_dst=src_vip),  # Keep destination as VIP
                     parser.OFPActionSetField(eth_src=dst_vip_mac),
-                    parser.OFPActionSetField(eth_dst=src_vip_mac),
+                    # Forwarding is to real_src's attachment port, so destination MAC must be
+                    # the real host MAC, not the virtual VIP MAC.
+                    parser.OFPActionSetField(eth_dst=src_real_mac),
                     parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD))
                 ]
                 self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
