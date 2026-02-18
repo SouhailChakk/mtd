@@ -538,9 +538,12 @@ class MovingTargetDefense(app_manager.RyuApp):
                     vip_mac = self.vip_mac_map.get(primary_vip)
                     if vip_mac:
                         self._send_arp_reply(
-                            dp, eth.src, vip_mac, primary_vip, arp_pkt.src_ip, in_port
+                            # For ARP requests to a real IP, keep SPA as the requested real IP
+                            # so the requester resolves dst_real in its ARP cache, while exposing
+                            # only the virtual VIP MAC at L2.
+                            dp, eth.src, vip_mac, target_ip, arp_pkt.src_ip, in_port
                         )
-                        self.logger.debug("ARP: replied real %s -> VIP %s", target_ip, primary_vip)
+                        self.logger.debug("ARP: replied real %s with VIP MAC %s", target_ip, vip_mac)
                 return
 
     def _handle_real_to_real(self, msg, dp, pkt, ip4, eth, in_port, dpid, src_real, dst_real):
