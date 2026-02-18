@@ -848,6 +848,8 @@ class MovingTargetDefense(app_manager.RyuApp):
             return
 
         dst_vip_mac = self.vip_mac_map.get(dst_vip)
+        if not dst_vip_mac:
+            return
 
         self._touch_vips(src_vip, dst_vip)
 
