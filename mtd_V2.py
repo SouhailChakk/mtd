@@ -261,9 +261,13 @@ class MovingTargetDefense(app_manager.RyuApp):
                 if old_vip and old_vip != new_vip:
                     self.vip_state[old_vip] = self.VIP_STATE_GRACE
                     self.vip_grace_until[old_vip] = now + self.GRACE_PERIOD
-                    # CRITICAL: Do NOT delete old flows immediately - they will expire naturally
-                    # or be preserved if vip_last_seen is being updated by active sessions
-                    self.logger.info("ROTATE: host=%s new=%s old=%s -> GRACE (flows preserved)",
+                    # IMPORTANT: reset carry-over activity when entering GRACE.
+                    # Only traffic seen during GRACE should preserve this old VIP.
+                    self.vip_active_sessions.discard(old_vip)
+                    self.vip_active_until.pop(old_vip, None)
+                    self.vip_last_seen[old_vip] = now
+                    # Keep old flows; active GRACE traffic will refresh vip_last_seen/active hold.
+                    self.logger.info("ROTATE: host=%s new=%s old=%s -> GRACE (activity reset)",
                                      host_ip, new_vip, old_vip)
 
     # ---------------- host discovery ----------------
@@ -421,8 +425,8 @@ class MovingTargetDefense(app_manager.RyuApp):
                 created = self.vip_created_at.get(vip, now)
                 uptime = f"{max(0.0, (now - created)):.1f}s"
                 state = self.vip_state.get(vip, "UNKNOWN")
-                # Mark as ACTIVE only if it has active sessions, not just because it's PRIMARY
-                is_active = vip in self.vip_active_sessions
+                # ACTIVE is evaluated from current activity window (not sticky membership).
+                is_active = self._is_vip_active(vip, now)
                 if is_active:
                     host_active += 1
                     active_total += 1
