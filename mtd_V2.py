@@ -546,6 +546,15 @@ class MovingTargetDefense(app_manager.RyuApp):
                         self.logger.debug("ARP: replied real %s with VIP MAC %s", target_ip, vip_mac)
                 return
 
+            # Unknown destination host: do not drop ARP discovery traffic.
+            # Flood request so target can answer and be learned dynamically.
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, ofp.OFPP_FLOOD)
+            return
+
+        # Forward ARP replies/other ARP frames so hosts can complete neighbor resolution.
+        out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+        self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
+
     def _handle_real_to_real(self, msg, dp, pkt, ip4, eth, in_port, dpid, src_real, dst_real):
         """Handle traffic between two real hosts: translate both to VIPs."""
         parser = dp.ofproto_parser
