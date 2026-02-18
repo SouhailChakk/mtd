@@ -203,6 +203,7 @@ class MovingTargetDefense(app_manager.RyuApp):
         if buffer_id is None:
             buffer_id = ofp.OFP_NO_BUFFER
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+        flags = ofp.OFPFF_SEND_FLOW_REM if cookie else 0
         mod = parser.OFPFlowMod(
             datapath=dp,
             table_id=table_id,
@@ -213,8 +214,18 @@ class MovingTargetDefense(app_manager.RyuApp):
             idle_timeout=idle_timeout,
             hard_timeout=hard_timeout,
             buffer_id=buffer_id,
+            flags=flags,
         )
         dp.send_msg(mod)
+
+        # Track VIP flow refs so long-lived sessions remain active even when packets
+        # stop hitting controller after proactive flow installation.
+        if cookie and (cookie & ~self.COOKIE_VIP_MASK) == self.COOKIE_BASE:
+            vip_int = cookie & self.COOKIE_VIP_MASK
+            vip = f"{(vip_int >> 24) & 0xFF}.{(vip_int >> 16) & 0xFF}.{(vip_int >> 8) & 0xFF}.{vip_int & 0xFF}"
+            if vip in self.vip_owner:
+                self.vip_flow_refcount[vip] = self.vip_flow_refcount.get(vip, 0) + 1
+                self.vip_active_sessions.add(vip)
 
     def _take_resource_vip(self) -> Optional[str]:
         """Take a VIP from the resource pool."""
