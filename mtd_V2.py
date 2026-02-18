@@ -733,7 +733,7 @@ class MovingTargetDefense(app_manager.RyuApp):
         dst_real_mac = self.host_ip_to_mac.get(real_dst)
         dst_vip_mac = self.vip_mac_map.get(dst_vip)
 
-        if not src_vip_mac or not dst_real_mac or not dst_vip_mac:
+        if not src_vip_mac or not dst_real_mac:
             return
 
         self._touch_vips(src_vip, dst_vip)
@@ -769,10 +769,13 @@ class MovingTargetDefense(app_manager.RyuApp):
             actions_rev = [
                 parser.OFPActionSetField(ipv4_src=dst_vip),  # Reverse SNAT: real -> VIP
                 parser.OFPActionSetField(ipv4_dst=src_real),  # Reverse DNAT: VIP -> real
-                parser.OFPActionSetField(eth_src=dst_vip_mac),
+            ]
+            if dst_vip_mac:
+                actions_rev.append(parser.OFPActionSetField(eth_src=dst_vip_mac))
+            actions_rev.extend([
                 parser.OFPActionSetField(eth_dst=src_real_mac),
                 parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD))
-            ]
+            ])
             self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
                           cookie=self._vip_cookie(dst_vip), idle_timeout=60)
             self._mark_vips_active_with_flow(src_vip, dst_vip)
@@ -882,12 +885,15 @@ class MovingTargetDefense(app_manager.RyuApp):
                 actions_rev = [
                     parser.OFPActionSetField(ipv4_src=dst_vip),  # Reverse SNAT: real -> VIP
                     parser.OFPActionSetField(ipv4_dst=src_vip),  # Keep destination as VIP
-                    parser.OFPActionSetField(eth_src=dst_vip_mac),
+                ]
+                if dst_vip_mac:
+                    actions_rev.append(parser.OFPActionSetField(eth_src=dst_vip_mac))
+                actions_rev.extend([
                     # Forwarding is to real_src's attachment port, so destination MAC must be
                     # the real host MAC, not the virtual VIP MAC.
                     parser.OFPActionSetField(eth_dst=src_real_mac),
                     parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD))
-                ]
+                ])
                 self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
                               cookie=self._vip_cookie(src_vip), idle_timeout=60)
                 self._mark_vips_active_with_flow(src_vip, dst_vip)
