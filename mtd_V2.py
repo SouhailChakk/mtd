@@ -37,13 +37,12 @@ class MovingTargetDefense(app_manager.RyuApp):
     ROTATE_INTERVAL = 60
     GRACE_PERIOD = 5
 
-    # Lightweight protocol-aware *activity windows* (seconds).
-    # VIP is considered ACTIVE only while packets keep arriving inside these windows.
-    SESSION_HOLD_ICMP = 2
-    SESSION_HOLD_UDP = 3
-    SESSION_HOLD_TCP = 5
-    SESSION_HOLD_TCP_CLOSING = 0
-    SESSION_HOLD_OTHER_IP = 2
+    # Lightweight protocol-aware activity hold (seconds)
+    SESSION_HOLD_ICMP = 20
+    SESSION_HOLD_UDP = 45
+    SESSION_HOLD_TCP = 120
+    SESSION_HOLD_TCP_CLOSING = 10
+    SESSION_HOLD_OTHER_IP = 30
     DISCOVERY_RANGE_LAST_OCTET_MAX = 10
     VIP_POOL_START = "10.0.0.11"
 
@@ -115,7 +114,7 @@ class MovingTargetDefense(app_manager.RyuApp):
 
             last_seen = self.vip_last_seen.get(vip, grace_until - self.GRACE_PERIOD)
             idle_time = now - last_seen
-            if idle_time >= self.GRACE_PERIOD:
+            if idle_time > self.GRACE_PERIOD:
                 self._reclaim_vip(vip)
 
         # Opportunistic cleanup of expired activity marks.
@@ -133,19 +132,19 @@ class MovingTargetDefense(app_manager.RyuApp):
             return
         self.vip_last_seen[vip] = now
         self.vip_active_sessions.add(vip)
-        keep_until = now + max(0.0, hold_s)
+        keep_until = now + max(1.0, hold_s)
         prev = self.vip_active_until.get(vip, 0.0)
         if keep_until > prev:
             self.vip_active_until[vip] = keep_until
 
     def _session_hold_for_packet(self, pkt) -> float:
-        """Return protocol-aware *activity window* for packet-driven liveness."""
+        """Return lightweight hold time based on packet protocol."""
         tcp_pkt = pkt.get_protocol(tcp.tcp)
         if tcp_pkt:
+            # TCP may be long-lived; keep VIP active longer unless closing observed.
             flags = getattr(tcp_pkt, 'bits', 0)
             fin = bool(flags & tcp.TCP_FIN)
             rst = bool(flags & tcp.TCP_RST)
-            # FIN/RST means session ended: mark idle immediately if no other traffic follows.
             if fin or rst:
                 return self.SESSION_HOLD_TCP_CLOSING
             return self.SESSION_HOLD_TCP
@@ -573,8 +572,23 @@ class MovingTargetDefense(app_manager.RyuApp):
                     self.logger.debug("ARP: replied VIP %s -> %s", target_ip, vip_mac)
                 return
 
-            # For real hosts, do normal ARP discovery instead of controller-side spoofing.
-            # This avoids neighbor-cache inconsistencies and keeps reachability stable.
+            # Check if request is for a real host (reply with VIP MAC)
+            if target_ip in self.detected_hosts:
+                primary_vip = self.primary_vip.get(target_ip)
+                if primary_vip:
+                    vip_mac = self.vip_mac_map.get(primary_vip)
+                    if vip_mac:
+                        self._send_arp_reply(
+                            # For ARP requests to a real IP, keep SPA as the requested real IP
+                            # so the requester resolves dst_real in its ARP cache, while exposing
+                            # only the virtual VIP MAC at L2.
+                            dp, eth.src, vip_mac, target_ip, arp_pkt.src_ip, in_port
+                        )
+                        self.logger.debug("ARP: replied real %s with VIP MAC %s", target_ip, vip_mac)
+                return
+
+            # Unknown destination host: do not drop ARP discovery traffic.
+            # Flood request so target can answer and be learned dynamically.
             self._forward_packet(msg, dp, in_port, dpid, eth.dst, ofp.OFPP_FLOOD)
             return
 
