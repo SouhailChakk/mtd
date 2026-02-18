@@ -531,8 +531,23 @@ class MovingTargetDefense(app_manager.RyuApp):
                     self.logger.debug("ARP: replied VIP %s -> %s", target_ip, vip_mac)
                 return
 
-            # For real hosts, do normal ARP discovery instead of controller-side spoofing.
-            # This avoids neighbor-cache inconsistencies and keeps reachability stable.
+            # Check if request is for a real host (reply with VIP MAC)
+            if target_ip in self.detected_hosts:
+                primary_vip = self.primary_vip.get(target_ip)
+                if primary_vip:
+                    vip_mac = self.vip_mac_map.get(primary_vip)
+                    if vip_mac:
+                        self._send_arp_reply(
+                            # For ARP requests to a real IP, keep SPA as the requested real IP
+                            # so the requester resolves dst_real in its ARP cache, while exposing
+                            # only the virtual VIP MAC at L2.
+                            dp, eth.src, vip_mac, target_ip, arp_pkt.src_ip, in_port
+                        )
+                        self.logger.debug("ARP: replied real %s with VIP MAC %s", target_ip, vip_mac)
+                return
+
+            # Unknown destination host: do not drop ARP discovery traffic.
+            # Flood request so target can answer and be learned dynamically.
             self._forward_packet(msg, dp, in_port, dpid, eth.dst, ofp.OFPP_FLOOD)
             return
 
