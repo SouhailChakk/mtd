@@ -36,6 +36,14 @@ class MovingTargetDefense(app_manager.RyuApp):
     HOUSEKEEPING_INTERVAL = 15
     ROTATE_INTERVAL = 60
     GRACE_PERIOD = 5
+
+    # Lightweight protocol-aware *activity windows* (seconds).
+    # VIP is considered ACTIVE only while packets keep arriving inside these windows.
+    SESSION_HOLD_ICMP = 2
+    SESSION_HOLD_UDP = 3
+    SESSION_HOLD_TCP = 5
+    SESSION_HOLD_TCP_CLOSING = 0
+    SESSION_HOLD_OTHER_IP = 2
     DISCOVERY_RANGE_LAST_OCTET_MAX = 10
     VIP_POOL_START = "10.0.0.11"
 
@@ -72,6 +80,8 @@ class MovingTargetDefense(app_manager.RyuApp):
         
         # Session tracking (for active/inactive VIP determination)
         self.vip_active_sessions: Set[str] = set()  # Set of VIPs that currently have active flows/sessions
+        self.vip_active_until: Dict[str, float] = {}  # VIP -> activity hold-until timestamp
+        self.vip_flow_refcount: Dict[str, int] = {}  # VIP -> installed active flow refs (cookie-tagged)
 
         # VIP resource pool
         self.Resources: List[str] = self._generate_vips(self.VIP_POOL_START, self.NUM_VIPS)  # Available VIPs (10.0.0.11-10.0.0.254)
@@ -94,22 +104,74 @@ class MovingTargetDefense(app_manager.RyuApp):
         now = time()
         # Proactive host discovery
         self._proactive_discovery(now)
-        # Reclaim VIPs in grace period that have expired (only if truly idle)
+        # Reclaim VIPs in grace period only when both: grace elapsed and no active hold.
         for vip, grace_until in list(self.vip_grace_until.items()):
-            if now >= grace_until:
-                # Check if VIP is still active based on last_seen
-                last_seen = self.vip_last_seen.get(vip, grace_until - self.GRACE_PERIOD)
-                idle_time = now - last_seen
-                if idle_time > self.GRACE_PERIOD:
-                    # VIP is idle beyond GRACE, safe to reclaim
-                    self._reclaim_vip(vip)
-                else:
-                    # Still active, keep it
-                    self.logger.debug("KEEP GRACE: VIP %s still active (idle %.1fs)", vip, idle_time)
+            if now < grace_until:
+                continue
+
+            if self._is_vip_active(vip, now):
+                self.logger.debug("KEEP GRACE: VIP %s still active (until %.1f)",
+                                  vip, self.vip_active_until.get(vip, 0.0))
+                continue
+
+            last_seen = self.vip_last_seen.get(vip, grace_until - self.GRACE_PERIOD)
+            idle_time = now - last_seen
+            if idle_time >= self.GRACE_PERIOD:
+                self._reclaim_vip(vip)
+
+        # Opportunistic cleanup of expired activity marks.
+        for vip in list(self.vip_active_sessions):
+            self._is_vip_active(vip, now)
+
         # Log VIP pools
         self._log_vip_pools(now)
 
     # ---------------- utils ----------------
+
+    def _mark_vip_active(self, vip: str, now: float, hold_s: float):
+        """Mark a VIP as active with a protocol-aware hold time."""
+        if vip not in self.vip_owner:
+            return
+        self.vip_last_seen[vip] = now
+        self.vip_active_sessions.add(vip)
+        keep_until = now + max(0.0, hold_s)
+        prev = self.vip_active_until.get(vip, 0.0)
+        if keep_until > prev:
+            self.vip_active_until[vip] = keep_until
+
+    def _session_hold_for_packet(self, pkt) -> float:
+        """Return protocol-aware *activity window* for packet-driven liveness."""
+        tcp_pkt = pkt.get_protocol(tcp.tcp)
+        if tcp_pkt:
+            flags = getattr(tcp_pkt, 'bits', 0)
+            fin = bool(flags & tcp.TCP_FIN)
+            rst = bool(flags & tcp.TCP_RST)
+            # FIN/RST means session ended: mark idle immediately if no other traffic follows.
+            if fin or rst:
+                return self.SESSION_HOLD_TCP_CLOSING
+            return self.SESSION_HOLD_TCP
+
+        if pkt.get_protocol(udp.udp):
+            return self.SESSION_HOLD_UDP
+
+        if pkt.get_protocol(icmp.icmp):
+            return self.SESSION_HOLD_ICMP
+
+        return self.SESSION_HOLD_OTHER_IP
+
+    def _is_vip_active(self, vip: str, now: float) -> bool:
+        """Check whether VIP is still active by flow refs or packet activity window."""
+        if self.vip_flow_refcount.get(vip, 0) > 0:
+            return True
+
+        until = self.vip_active_until.get(vip, 0.0)
+        if now < until:
+            return True
+
+        # Expired and no live flow refs: clean up lazy markers.
+        self.vip_active_until.pop(vip, None)
+        self.vip_active_sessions.discard(vip)
+        return False
 
     def _generate_vips(self, start_ip: str, count: int) -> List[str]:
         base = list(map(int, start_ip.split('.')))
@@ -147,6 +209,7 @@ class MovingTargetDefense(app_manager.RyuApp):
         if buffer_id is None:
             buffer_id = ofp.OFP_NO_BUFFER
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+        flags = ofp.OFPFF_SEND_FLOW_REM if cookie else 0
         mod = parser.OFPFlowMod(
             datapath=dp,
             table_id=table_id,
@@ -157,8 +220,18 @@ class MovingTargetDefense(app_manager.RyuApp):
             idle_timeout=idle_timeout,
             hard_timeout=hard_timeout,
             buffer_id=buffer_id,
+            flags=flags,
         )
         dp.send_msg(mod)
+
+        # Track VIP flow refs so long-lived sessions remain active even when packets
+        # stop hitting controller after proactive flow installation.
+        if cookie and (cookie & ~self.COOKIE_VIP_MASK) == self.COOKIE_BASE:
+            vip_int = cookie & self.COOKIE_VIP_MASK
+            vip = f"{(vip_int >> 24) & 0xFF}.{(vip_int >> 16) & 0xFF}.{(vip_int >> 8) & 0xFF}.{vip_int & 0xFF}"
+            if vip in self.vip_owner:
+                self.vip_flow_refcount[vip] = self.vip_flow_refcount.get(vip, 0) + 1
+                self.vip_active_sessions.add(vip)
 
     def _take_resource_vip(self) -> Optional[str]:
         """Take a VIP from the resource pool."""
@@ -205,9 +278,12 @@ class MovingTargetDefense(app_manager.RyuApp):
                 if old_vip and old_vip != new_vip:
                     self.vip_state[old_vip] = self.VIP_STATE_GRACE
                     self.vip_grace_until[old_vip] = now + self.GRACE_PERIOD
-                    # CRITICAL: Do NOT delete old flows immediately - they will expire naturally
-                    # or be preserved if vip_last_seen is being updated by active sessions
-                    self.logger.info("ROTATE: host=%s new=%s old=%s -> GRACE (flows preserved)",
+                    # IMPORTANT: reset carry-over activity when entering GRACE.
+                    # Only traffic seen during GRACE should preserve this old VIP.
+                    self.vip_active_until.pop(old_vip, None)
+                    self.vip_last_seen[old_vip] = now
+                    # Keep old flows; active GRACE traffic will refresh vip_last_seen/active hold.
+                    self.logger.info("ROTATE: host=%s new=%s old=%s -> GRACE (activity reset)",
                                      host_ip, new_vip, old_vip)
 
     # ---------------- host discovery ----------------
@@ -365,8 +441,8 @@ class MovingTargetDefense(app_manager.RyuApp):
                 created = self.vip_created_at.get(vip, now)
                 uptime = f"{max(0.0, (now - created)):.1f}s"
                 state = self.vip_state.get(vip, "UNKNOWN")
-                # Mark as ACTIVE only if it has active sessions, not just because it's PRIMARY
-                is_active = vip in self.vip_active_sessions
+                # ACTIVE is evaluated from current activity window (not sticky membership).
+                is_active = self._is_vip_active(vip, now)
                 if is_active:
                     host_active += 1
                     active_total += 1
@@ -384,21 +460,18 @@ class MovingTargetDefense(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPFlowRemoved, MAIN_DISPATCHER)
     def _flow_removed_handler(self, ev):
-        """Track flow removals to update active session tracking."""
+        """Track VIP flow refs using flow-removed events."""
         msg = ev.msg
         cookie = msg.cookie
-        
-        # Check if this cookie corresponds to a VIP (has COOKIE_BASE prefix)
+
         if (cookie & ~self.COOKIE_VIP_MASK) == self.COOKIE_BASE:
-            # Find VIP by matching cookie
-            for vip in list(self.vip_active_sessions):
-                if self._vip_cookie(vip) == cookie:
-                    # Note: We remove it from active sessions when flow expires
-                    # In a more sophisticated implementation, you'd check if there are
-                    # other flows still active for this VIP before removing
-                    self.vip_active_sessions.discard(vip)
-                    self.logger.debug("FLOW_REMOVED: VIP %s flow expired (cookie=0x%x), marking as inactive", vip, cookie)
-                    break
+            vip_int = cookie & self.COOKIE_VIP_MASK
+            vip = f"{(vip_int >> 24) & 0xFF}.{(vip_int >> 16) & 0xFF}.{(vip_int >> 8) & 0xFF}.{vip_int & 0xFF}"
+            if vip in self.vip_flow_refcount:
+                self.vip_flow_refcount[vip] = max(0, self.vip_flow_refcount[vip] - 1)
+                if self.vip_flow_refcount[vip] == 0:
+                    self.vip_flow_refcount.pop(vip, None)
+            self.logger.debug("FLOW_REMOVED: vip=%s cookie=0x%x refs=%d", vip, cookie, self.vip_flow_refcount.get(vip, 0))
 
     # ---------------- VIP reclamation ----------------
 
@@ -419,6 +492,8 @@ class MovingTargetDefense(app_manager.RyuApp):
         self.vip_created_at.pop(vip, None)
         self.vip_last_seen.pop(vip, None)  # Clear activity tracking
         self.vip_active_sessions.discard(vip)  # Remove from active sessions
+        self.vip_active_until.pop(vip, None)  # Clear active hold
+        self.vip_flow_refcount.pop(vip, None)  # Clear flow refs
 
         # If it was primary, clear it
         if self.primary_vip.get(owner) == vip:
@@ -464,24 +539,13 @@ class MovingTargetDefense(app_manager.RyuApp):
         self._learn_host(pkt, dpid)
         src_ip, dst_ip = ip4.src, ip4.dst
 
-        # Handle ICMP packets specifically (ping/echo)
-        icmp_pkt = pkt.get_protocol(icmp.icmp)
-        if icmp_pkt:
-            # Update VIP activity tracking for ICMP (CRITICAL: prevents premature reclaim during ping)
-            if dst_ip in self.vip_owner:
-                self.vip_last_seen[dst_ip] = time()
-                self.logger.info("[ICMP] Updated vip_last_seen[%s] (ping active)", dst_ip)
-            if src_ip in self.vip_owner:
-                self.vip_last_seen[src_ip] = time()
-                self.logger.info("[ICMP] Updated vip_last_seen[%s] (ping reply active)", src_ip)
-
-        # Update VIP activity tracking for all IP packets (CRITICAL: prevents premature reclaim during active sessions)
+        # Lightweight protocol-aware activity hold for session preservation.
+        now = time()
+        hold_s = self._session_hold_for_packet(pkt)
         if dst_ip in self.vip_owner:
-            self.vip_last_seen[dst_ip] = time()
-            self.logger.debug("Updated vip_last_seen[%s] (packet to VIP)", dst_ip)
+            self._mark_vip_active(dst_ip, now, hold_s)
         if src_ip in self.vip_owner:
-            self.vip_last_seen[src_ip] = time()
-            self.logger.debug("Updated vip_last_seen[%s] (packet from VIP)", src_ip)
+            self._mark_vip_active(src_ip, now, hold_s)
 
         # Determine if src/dst are real IPs or VIPs
         src_is_real = src_ip in self.detected_hosts
@@ -531,17 +595,14 @@ class MovingTargetDefense(app_manager.RyuApp):
                     self.logger.debug("ARP: replied VIP %s -> %s", target_ip, vip_mac)
                 return
 
-            # Check if request is for a real host (reply with VIP MAC)
-            if target_ip in self.detected_hosts:
-                primary_vip = self.primary_vip.get(target_ip)
-                if primary_vip:
-                    vip_mac = self.vip_mac_map.get(primary_vip)
-                    if vip_mac:
-                        self._send_arp_reply(
-                            dp, eth.src, vip_mac, primary_vip, arp_pkt.src_ip, in_port
-                        )
-                        self.logger.debug("ARP: replied real %s -> VIP %s", target_ip, primary_vip)
-                return
+            # For real hosts, do normal ARP discovery instead of controller-side spoofing.
+            # This avoids neighbor-cache inconsistencies and keeps reachability stable.
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, ofp.OFPP_FLOOD)
+            return
+
+        # Forward ARP replies/other ARP frames so hosts can complete neighbor resolution.
+        out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+        self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
 
     def _handle_real_to_real(self, msg, dp, pkt, ip4, eth, in_port, dpid, src_real, dst_real):
         """Handle traffic between two real hosts: translate both to VIPs."""
@@ -742,7 +803,9 @@ class MovingTargetDefense(app_manager.RyuApp):
             if src_vip_mac:
                 actions_rev = [
                     parser.OFPActionSetField(ipv4_dst=src_vip),  # Reverse DNAT: real -> VIP
-                    parser.OFPActionSetField(eth_dst=src_vip_mac),
+                    # Packet is delivered to the real host owning src_vip, so L2 dst must be
+                    # that host's MAC (not the VIP virtual MAC) to avoid NIC-level drops.
+                    parser.OFPActionSetField(eth_dst=src_real_mac),
                     parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD))
                 ]
                 self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
@@ -794,7 +857,9 @@ class MovingTargetDefense(app_manager.RyuApp):
                     parser.OFPActionSetField(ipv4_src=dst_vip),  # Reverse SNAT: real -> VIP
                     parser.OFPActionSetField(ipv4_dst=src_vip),  # Keep destination as VIP
                     parser.OFPActionSetField(eth_src=dst_vip_mac),
-                    parser.OFPActionSetField(eth_dst=src_vip_mac),
+                    # Forwarding is to real_src's attachment port, so destination MAC must be
+                    # the real host MAC, not the virtual VIP MAC.
+                    parser.OFPActionSetField(eth_dst=src_real_mac),
                     parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD))
                 ]
                 self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
