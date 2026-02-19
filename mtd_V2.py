@@ -109,23 +109,9 @@ class MovingTargetDefense(app_manager.RyuApp):
                 self.vip_active_sessions.discard(vip)
                 self.logger.info("IDLE: VIP %s marked as idle (no active flows)", vip)
         
-        # Reclaim VIPs in grace period that have expired (only if truly idle and no active sessions)
-        for vip, grace_until in list(self.vip_grace_until.items()):
-            if now >= grace_until:
-                # Check if VIP is idle (no active sessions)
-                flow_count = self.vip_flow_count.get(vip, 0)
-                is_idle = (vip not in self.vip_active_sessions) or (flow_count == 0)
-                
-                if is_idle:
-                    # VIP is idle in GRACE, delete flows immediately and reclaim
-                    self.logger.info("GRACE_IDLE: VIP %s is idle in GRACE, deleting flows and reclaiming", vip)
-                    self._delete_flows_by_cookie(vip)
-                    # Clear flow count since we're deleting flows
-                    self.vip_flow_count.pop(vip, None)
-                    self._reclaim_vip(vip)
-                else:
-                    # Still active, keep it
-                    self.logger.debug("KEEP GRACE: VIP %s still active (%d flows), preserving", vip, flow_count)
+        # Enforce strict policy: any GRACE VIP that is idle is reclaimed immediately.
+        for vip in list(self.vip_grace_until):
+            self._reclaim_grace_vip_if_idle(vip)
         # Log VIP pools
         self._log_vip_pools(now)
 
@@ -159,6 +145,24 @@ class MovingTargetDefense(app_manager.RyuApp):
 
     def _vip_cookie(self, vip: str) -> int:
         return self.COOKIE_BASE | (self._ip_to_int(vip) & self.COOKIE_VIP_MASK)
+
+    def _reclaim_grace_vip_if_idle(self, vip: str) -> bool:
+        """Immediately reclaim a GRACE VIP when it has no active flows."""
+        if vip not in self.vip_grace_until:
+            return False
+
+        flow_count = self.vip_flow_count.get(vip, 0)
+        is_idle = (vip not in self.vip_active_sessions) or (flow_count == 0)
+        if not is_idle:
+            self.logger.debug("KEEP GRACE: VIP %s still active (%d flows), preserving", vip, flow_count)
+            return False
+
+        self.logger.info("GRACE_IDLE: VIP %s is idle in GRACE, deleting flows and reclaiming immediately", vip)
+        self._delete_flows_by_cookie(vip)
+        self.vip_flow_count.pop(vip, None)
+        self.vip_active_sessions.discard(vip)
+        self._reclaim_vip(vip)
+        return True
 
     def _delete_flows_by_cookie(self, vip: str):
         """Delete all flows for a VIP by matching cookie."""
@@ -467,21 +471,7 @@ class MovingTargetDefense(app_manager.RyuApp):
         # Only remove from active_sessions when ALL flows for this VIP expire
         if remaining == 0:
             self.logger.info("FLOW_REMOVED: VIP %s all flows expired, marking as inactive", vip)
-
-            # Check if VIP should be reclaimed (past grace period and no active sessions)
-            now = time()
-            if vip in self.vip_grace_until:
-                grace_until = self.vip_grace_until[vip]
-                if now >= grace_until:
-                    last_seen = self.vip_last_seen.get(vip, grace_until - self.GRACE_PERIOD)
-                    idle_time = now - last_seen
-                    if idle_time > self.GRACE_PERIOD:
-                        self.logger.info("FLOW_REMOVED: Reclaiming VIP %s (grace expired %.1fs ago, no active sessions)",
-                                         vip, idle_time)
-                        self._reclaim_vip(vip)
-                    else:
-                        self.logger.debug("FLOW_REMOVED: VIP %s still in grace (idle %.1fs < %.1fs)",
-                                          vip, idle_time, self.GRACE_PERIOD)
+            self._reclaim_grace_vip_if_idle(vip)
 
     # ---------------- VIP reclamation ----------------
 
