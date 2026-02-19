@@ -245,6 +245,13 @@ class MovingTargetDefense(app_manager.RyuApp):
         )
         dp.send_msg(mod)
 
+    def _track_flow_cookie(self, cookie: int):
+        """Track active flow counters using the VIP encoded in cookie."""
+        vip = self._cookie_vip_ip(cookie)
+        if vip in self.vip_owner:
+            self.vip_active_sessions.add(vip)
+            self.vip_flow_count[vip] = self.vip_flow_count.get(vip, 0) + 1
+
     def _take_resource_vip(self) -> Optional[str]:
         """Take a VIP from the resource pool."""
         if self.Resources:
@@ -803,6 +810,7 @@ class MovingTargetDefense(app_manager.RyuApp):
         # This ensures TCP SYN and other first packets are sent immediately
         self._send_packet_out(msg, dp, in_port, actions)
         # Now install flow for subsequent packets
+        cookie_fwd = self._session_cookie(src_vip, pkt, ip4, "fwd")
         self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
                       cookie=self._session_cookie(src_vip, pkt, ip4, "fwd"), idle_timeout=60)
         # Mark both VIPs as having active session and increment flow count
@@ -834,6 +842,7 @@ class MovingTargetDefense(app_manager.RyuApp):
                 parser.OFPActionSetField(eth_dst=src_real_mac),  # Destination MAC is real host MAC
                 parser.OFPActionOutput(src_port)
             ]
+            cookie_rev = self._session_cookie(dst_vip, pkt, ip4, "rev")
             self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
                           cookie=self._session_cookie(dst_vip, pkt, ip4, "rev"), idle_timeout=60)
             # Mark both VIPs as having active session and increment flow count
@@ -852,6 +861,7 @@ class MovingTargetDefense(app_manager.RyuApp):
                 parser.OFPActionSetField(eth_dst=src_real_mac),
                 parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD))
             ]
+            cookie_vip_reply = self._session_cookie(dst_vip, pkt, ip4, "rev")
             self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_vip_reply, actions=actions_vip_reply,
                           cookie=self._session_cookie(dst_vip, pkt, ip4, "rev"), idle_timeout=60)
             self.vip_active_sessions.add(src_vip)
@@ -909,6 +919,7 @@ class MovingTargetDefense(app_manager.RyuApp):
         # CRITICAL: Send packet out FIRST for TCP SYN and other first packets
         self._send_packet_out(msg, dp, in_port, actions)
         # Now install flow for subsequent packets
+        cookie_fwd = self._session_cookie(src_vip, pkt, ip4, "fwd")
         self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
                       cookie=self._session_cookie(src_vip, pkt, ip4, "fwd"), idle_timeout=60)
         self.vip_active_sessions.add(src_vip)
@@ -927,6 +938,7 @@ class MovingTargetDefense(app_manager.RyuApp):
                 parser.OFPActionSetField(eth_dst=src_real_mac),
                 parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD))
             ]
+            cookie_rev = self._session_cookie(dst_vip, pkt, ip4, "rev")
             self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
                           cookie=self._session_cookie(dst_vip, pkt, ip4, "rev"), idle_timeout=60)
             self.vip_active_sessions.add(src_vip)
@@ -971,6 +983,7 @@ class MovingTargetDefense(app_manager.RyuApp):
         # CRITICAL: Send packet out FIRST for TCP SYN and other first packets
         self._send_packet_out(msg, dp, in_port, actions)
         # Now install flow for subsequent packets
+        cookie_fwd = self._session_cookie(src_vip, pkt, ip4, "fwd")
         self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
                       cookie=self._session_cookie(src_vip, pkt, ip4, "fwd"), idle_timeout=60)
         self.vip_active_sessions.add(src_vip)
@@ -989,6 +1002,7 @@ class MovingTargetDefense(app_manager.RyuApp):
                     parser.OFPActionSetField(eth_dst=src_real_mac),
                     parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD))
                 ]
+                cookie_rev = self._session_cookie(src_vip, pkt, ip4, "rev")
                 self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
                               cookie=self._session_cookie(src_vip, pkt, ip4, "fwd"), idle_timeout=60)
                 self.vip_active_sessions.add(src_vip)
@@ -1036,6 +1050,7 @@ class MovingTargetDefense(app_manager.RyuApp):
         # CRITICAL: Send packet out FIRST for TCP SYN and other first packets
         self._send_packet_out(msg, dp, in_port, actions)
         # Now install flow for subsequent packets
+        cookie_fwd = self._session_cookie(dst_vip, pkt, ip4, "fwd")
         self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
                       cookie=self._session_cookie(dst_vip, pkt, ip4, "rev"), idle_timeout=60)
         self.vip_active_sessions.add(dst_vip)
@@ -1057,6 +1072,7 @@ class MovingTargetDefense(app_manager.RyuApp):
                     parser.OFPActionSetField(eth_dst=src_real_mac),
                     parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD))
                 ]
+                cookie_rev = self._session_cookie(src_vip, pkt, ip4, "rev")
                 self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
                               cookie=self._session_cookie(src_vip, pkt, ip4, "fwd"), idle_timeout=60)
                 self.vip_active_sessions.add(src_vip)
