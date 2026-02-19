@@ -97,56 +97,35 @@ class MovingTargetDefense(app_manager.RyuApp):
         # Proactive host discovery
         self._proactive_discovery(now)
         
-        # Check for idle VIPs and mark them as inactive if no traffic for threshold period
+        # Check for idle VIPs - only mark idle when flows actually expire
+        # CRITICAL: Once flows are installed, packets bypass controller, so vip_last_seen stops updating
+        # Flows are the source of truth - if flows exist, VIP is active (even if vip_last_seen is stale)
         for vip in list(self.vip_active_sessions):
             flow_count = self.vip_flow_count.get(vip, 0)
-            if flow_count <= 0:
+            
+            # Only mark idle if no flows exist (flows expired naturally)
+            # Don't mark idle based on vip_last_seen - flows are being used even if controller doesn't see packets
+            if flow_count == 0:
                 self.vip_active_sessions.discard(vip)
-                self.vip_flow_count.pop(vip, None)
                 self.logger.info("IDLE: VIP %s marked as idle (no active flows)", vip)
-                if self.vip_state.get(vip) == self.VIP_STATE_GRACE:
-                    self._delete_vip_flows(vip)
-                    self.logger.info("GRACE_CLEANUP: deleted flows for idle VIP %s in GRACE", vip)
-                continue
-
-            last_seen = self.vip_last_seen.get(vip)
-            if not last_seen:
-                self.vip_active_sessions.discard(vip)
-                self.logger.info("IDLE: VIP %s marked as idle (missing last_seen timestamp)", vip)
-                if self.vip_state.get(vip) == self.VIP_STATE_GRACE:
-                    self._delete_vip_flows(vip)
-                    self.vip_flow_count.pop(vip, None)
-                    self.logger.info("GRACE_CLEANUP: deleted flows for idle VIP %s in GRACE", vip)
-                continue
-
-            idle_time = now - last_seen
-            if idle_time > self.SESSION_IDLE_THRESHOLD:
-                # VIP has been idle for threshold period, mark as inactive
-                self.vip_active_sessions.discard(vip)
-                self.logger.info("IDLE: VIP %s marked as idle (no packets for %.1fs)", vip, idle_time)
-                if self.vip_state.get(vip) == self.VIP_STATE_GRACE:
-                    self._delete_vip_flows(vip)
-                    self.vip_flow_count.pop(vip, None)
-                    self.logger.info("GRACE_CLEANUP: deleted flows for idle VIP %s in GRACE", vip)
         
         # Reclaim VIPs in grace period that have expired (only if truly idle and no active sessions)
         for vip, grace_until in list(self.vip_grace_until.items()):
             if now >= grace_until:
-                # CRITICAL: Never reclaim VIPs with active sessions, regardless of grace period
-                if vip in self.vip_active_sessions:
-                    flow_count = self.vip_flow_count.get(vip, 0)
-                    self.logger.debug("KEEP GRACE: VIP %s has active sessions (%d flows), preserving", vip, flow_count)
-                    continue
+                # Check if VIP is idle (no active sessions)
+                flow_count = self.vip_flow_count.get(vip, 0)
+                is_idle = (vip not in self.vip_active_sessions) or (flow_count == 0)
                 
-                # Check if VIP is still active based on last_seen
-                last_seen = self.vip_last_seen.get(vip, grace_until - self.GRACE_PERIOD)
-                idle_time = now - last_seen
-                if idle_time > self.GRACE_PERIOD:
-                    # VIP is idle beyond GRACE and no active sessions, safe to reclaim
+                if is_idle:
+                    # VIP is idle in GRACE, delete flows immediately and reclaim
+                    self.logger.info("GRACE_IDLE: VIP %s is idle in GRACE, deleting flows and reclaiming", vip)
+                    self._delete_flows_by_cookie(vip)
+                    # Clear flow count since we're deleting flows
+                    self.vip_flow_count.pop(vip, None)
                     self._reclaim_vip(vip)
                 else:
                     # Still active, keep it
-                    self.logger.debug("KEEP GRACE: VIP %s still active (idle %.1fs)", vip, idle_time)
+                    self.logger.debug("KEEP GRACE: VIP %s still active (%d flows), preserving", vip, flow_count)
         # Log VIP pools
         self._log_vip_pools(now)
 
@@ -181,41 +160,29 @@ class MovingTargetDefense(app_manager.RyuApp):
     def _vip_cookie(self, vip: str) -> int:
         return self.COOKIE_BASE | (self._ip_to_int(vip) & self.COOKIE_VIP_MASK)
 
-    def _build_ip_match(self, parser, pkt, ipv4_src: str, ipv4_dst: str, reverse_l4: bool = False):
-        """Build an IPv4 match including L4 fields for TCP/UDP session safety."""
-        match_kwargs = {
-            'eth_type': 0x0800,
-            'ipv4_src': ipv4_src,
-            'ipv4_dst': ipv4_dst,
-        }
-
-        tcp_pkt = pkt.get_protocol(tcp.tcp)
-        if tcp_pkt:
-            match_kwargs['ip_proto'] = 6
-            if reverse_l4:
-                match_kwargs['tcp_src'] = tcp_pkt.dst_port
-                match_kwargs['tcp_dst'] = tcp_pkt.src_port
-            else:
-                match_kwargs['tcp_src'] = tcp_pkt.src_port
-                match_kwargs['tcp_dst'] = tcp_pkt.dst_port
-            return parser.OFPMatch(**match_kwargs)
-
-        udp_pkt = pkt.get_protocol(udp.udp)
-        if udp_pkt:
-            match_kwargs['ip_proto'] = 17
-            if reverse_l4:
-                match_kwargs['udp_src'] = udp_pkt.dst_port
-                match_kwargs['udp_dst'] = udp_pkt.src_port
-            else:
-                match_kwargs['udp_src'] = udp_pkt.src_port
-                match_kwargs['udp_dst'] = udp_pkt.dst_port
-            return parser.OFPMatch(**match_kwargs)
-
-        icmp_pkt = pkt.get_protocol(icmp.icmp)
-        if icmp_pkt:
-            match_kwargs['ip_proto'] = 1
-
-        return parser.OFPMatch(**match_kwargs)
+    def _delete_flows_by_cookie(self, vip: str):
+        """Delete all flows for a VIP by matching cookie."""
+        cookie = self._vip_cookie(vip)
+        cookie_mask = 0xFFFFFFFF  # Match lower 32 bits (VIP IP)
+        
+        for dp in list(self.datapaths):
+            try:
+                parser = dp.ofproto_parser
+                ofp = dp.ofproto
+                # Delete flows matching this cookie
+                mod = parser.OFPFlowMod(
+                    datapath=dp,
+                    table_id=ofp.OFPTT_ALL,
+                    command=ofp.OFPFC_DELETE,
+                    out_port=ofp.OFPP_ANY,
+                    out_group=ofp.OFPG_ANY,
+                    cookie=cookie,
+                    cookie_mask=cookie_mask,
+                )
+                dp.send_msg(mod)
+                self.logger.info("FLOW_DELETE: Deleted flows for VIP %s (cookie=0x%x)", vip, cookie)
+            except Exception as e:
+                self.logger.warning("FLOW_DELETE: Failed to delete flows for VIP %s: %s", vip, e)
 
     def _add_flow(self, dp, priority, match, actions, table_id=0, idle_timeout=0, hard_timeout=0, buffer_id=None, cookie=0):
         """Install a flow rule on the switch."""
@@ -733,6 +700,13 @@ class MovingTargetDefense(app_manager.RyuApp):
             parser.OFPActionSetField(eth_dst=dst_real_mac),  # Destination MAC is real host MAC
             parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(dst_real_mac, ofp.OFPP_FLOOD))
         ]
+        # CRITICAL: Update vip_last_seen for BOTH VIPs before sending packet
+        # This ensures both source and destination VIPs are tracked as active
+        now_pkt = time()
+        self.vip_last_seen[src_vip] = now_pkt
+        self.vip_last_seen[dst_vip] = now_pkt
+        self.logger.debug("REAL-TO-REAL: Updated vip_last_seen for src_vip=%s and dst_vip=%s", src_vip, dst_vip)
+        
         # CRITICAL: Send packet out FIRST, then install flow for future packets
         # This ensures TCP SYN and other first packets are sent immediately
         self._send_packet_out(msg, dp, in_port, actions)
@@ -825,6 +799,11 @@ class MovingTargetDefense(app_manager.RyuApp):
             parser.OFPActionSetField(eth_dst=dst_real_mac),
             parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(dst_real_mac, ofp.OFPP_FLOOD))
         ]
+        # CRITICAL: Update vip_last_seen for BOTH VIPs before sending packet
+        now_pkt = time()
+        self.vip_last_seen[src_vip] = now_pkt
+        self.vip_last_seen[dst_vip] = now_pkt
+        
         # CRITICAL: Send packet out FIRST for TCP SYN and other first packets
         self._send_packet_out(msg, dp, in_port, actions)
         # Now install flow for subsequent packets
@@ -883,6 +862,10 @@ class MovingTargetDefense(app_manager.RyuApp):
             parser.OFPActionSetField(eth_dst=dst_real_mac),
             parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(dst_real_mac, ofp.OFPP_FLOOD))
         ]
+        # CRITICAL: Update vip_last_seen for source VIP before sending packet
+        now_pkt = time()
+        self.vip_last_seen[src_vip] = now_pkt
+        
         # CRITICAL: Send packet out FIRST for TCP SYN and other first packets
         self._send_packet_out(msg, dp, in_port, actions)
         # Now install flow for subsequent packets
@@ -949,6 +932,11 @@ class MovingTargetDefense(app_manager.RyuApp):
             parser.OFPActionSetField(eth_dst=dst_real_mac),
             parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(dst_real_mac, ofp.OFPP_FLOOD))
         ]
+        # CRITICAL: Update vip_last_seen for BOTH VIPs before sending packet
+        now_pkt = time()
+        self.vip_last_seen[src_vip] = now_pkt
+        self.vip_last_seen[dst_vip] = now_pkt
+        
         # CRITICAL: Send packet out FIRST for TCP SYN and other first packets
         self._send_packet_out(msg, dp, in_port, actions)
         # Now install flow for subsequent packets
