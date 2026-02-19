@@ -198,6 +198,7 @@ class MovingTargetDefense(app_manager.RyuApp):
             match=match,
             instructions=inst,
             cookie=cookie,
+            flags=ofp.OFPFF_SEND_FLOW_REM,
             idle_timeout=idle_timeout,
             hard_timeout=hard_timeout,
             buffer_id=buffer_id,
@@ -433,39 +434,54 @@ class MovingTargetDefense(app_manager.RyuApp):
         cookie = msg.cookie
         
         # Check if this cookie corresponds to a VIP (has COOKIE_BASE prefix)
-        if (cookie & ~self.COOKIE_VIP_MASK) == self.COOKIE_BASE:
-            # Find VIP by matching cookie (cookie encodes VIP IP in lower 32 bits)
-            for vip in list(self.vip_active_sessions):
-                if self._vip_cookie(vip) == cookie:
-                    # Decrement flow count for this VIP
-                    current_count = self.vip_flow_count.get(vip, 0)
-                    if current_count > 0:
-                        self.vip_flow_count[vip] = current_count - 1
-                        remaining = self.vip_flow_count[vip]
-                        self.logger.debug("FLOW_REMOVED: VIP %s flow expired (cookie=0x%x), remaining flows=%d", 
-                                         vip, cookie, remaining)
-                        
-                        # Only remove from active_sessions when ALL flows for this VIP expire
-                        if remaining == 0:
-                            self.vip_active_sessions.discard(vip)
-                            self.vip_flow_count.pop(vip, None)
-                            self.logger.info("FLOW_REMOVED: VIP %s all flows expired, marking as inactive", vip)
-                            
-                            # Check if VIP should be reclaimed (past grace period and no active sessions)
-                            now = time()
-                            if vip in self.vip_grace_until:
-                                grace_until = self.vip_grace_until[vip]
-                                if now >= grace_until:
-                                    last_seen = self.vip_last_seen.get(vip, grace_until - self.GRACE_PERIOD)
-                                    idle_time = now - last_seen
-                                    if idle_time > self.GRACE_PERIOD:
-                                        self.logger.info("FLOW_REMOVED: Reclaiming VIP %s (grace expired %.1fs ago, no active sessions)", 
-                                                        vip, idle_time)
-                                        self._reclaim_vip(vip)
-                                    else:
-                                        self.logger.debug("FLOW_REMOVED: VIP %s still in grace (idle %.1fs < %.1fs)", 
-                                                         vip, idle_time, self.GRACE_PERIOD)
-                    break
+        if (cookie & ~self.COOKIE_VIP_MASK) != self.COOKIE_BASE:
+            return
+
+        # Resolve VIP from cookie directly, independent of active_sessions state.
+        vip = None
+        for candidate_vip in self.vip_owner:
+            if self._vip_cookie(candidate_vip) == cookie:
+                vip = candidate_vip
+                break
+
+        if not vip:
+            return
+
+        # Decrement flow count for this VIP (never negative).
+        current_count = self.vip_flow_count.get(vip, 0)
+        if current_count <= 0:
+            self.vip_flow_count.pop(vip, None)
+            self.vip_active_sessions.discard(vip)
+            return
+
+        remaining = current_count - 1
+        if remaining > 0:
+            self.vip_flow_count[vip] = remaining
+        else:
+            self.vip_flow_count.pop(vip, None)
+            self.vip_active_sessions.discard(vip)
+
+        self.logger.debug("FLOW_REMOVED: VIP %s flow expired (cookie=0x%x), remaining flows=%d",
+                          vip, cookie, max(0, remaining))
+
+        # Only remove from active_sessions when ALL flows for this VIP expire
+        if remaining == 0:
+            self.logger.info("FLOW_REMOVED: VIP %s all flows expired, marking as inactive", vip)
+
+            # Check if VIP should be reclaimed (past grace period and no active sessions)
+            now = time()
+            if vip in self.vip_grace_until:
+                grace_until = self.vip_grace_until[vip]
+                if now >= grace_until:
+                    last_seen = self.vip_last_seen.get(vip, grace_until - self.GRACE_PERIOD)
+                    idle_time = now - last_seen
+                    if idle_time > self.GRACE_PERIOD:
+                        self.logger.info("FLOW_REMOVED: Reclaiming VIP %s (grace expired %.1fs ago, no active sessions)",
+                                         vip, idle_time)
+                        self._reclaim_vip(vip)
+                    else:
+                        self.logger.debug("FLOW_REMOVED: VIP %s still in grace (idle %.1fs < %.1fs)",
+                                          vip, idle_time, self.GRACE_PERIOD)
 
     # ---------------- VIP reclamation ----------------
 
@@ -629,13 +645,21 @@ class MovingTargetDefense(app_manager.RyuApp):
 
         if not src_vip or not dst_vip:
             self.logger.warning("REAL-TO-REAL: Missing VIP for src=%s or dst=%s", src_real, dst_real)
+            out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
             return
+
+        now_pkt = time()
+        self.vip_last_seen[src_vip] = now_pkt
+        self.vip_last_seen[dst_vip] = now_pkt
 
         src_vip_mac = self.vip_mac_map.get(src_vip)
         dst_real_mac = self.host_ip_to_mac.get(dst_real)
 
         if not src_vip_mac or not dst_real_mac:
             self.logger.warning("REAL-TO-REAL: Missing MAC for translation")
+            out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
             return
 
         # Install forward flow: src_real -> dst_real becomes src_vip -> dst_vip
@@ -648,6 +672,8 @@ class MovingTargetDefense(app_manager.RyuApp):
         dst_vip_mac = self.vip_mac_map.get(dst_vip)
         if not dst_vip_mac:
             self.logger.warning("REAL-TO-REAL: Missing VIP MAC for dst_vip=%s", dst_vip)
+            out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
             return
         
         actions = [
@@ -687,7 +713,7 @@ class MovingTargetDefense(app_manager.RyuApp):
                 ipv4_dst=src_real
             )
             actions_rev = [
-                parser.OFPActionSetField(ipv4_src=dst_vip),  # SNAT: real -> VIP (h2's reply uses VIP)
+                parser.OFPActionSetField(ipv4_src=dst_real),  # Keep source as real IP for host TCP/UDP compatibility
                 parser.OFPActionSetField(ipv4_dst=src_real),  # Keep destination as real IP (h1 needs to accept it)
                 parser.OFPActionSetField(eth_src=dst_vip_mac),  # Source MAC is VIP MAC
                 parser.OFPActionSetField(eth_dst=src_real_mac),  # Destination MAC is real host MAC
@@ -709,7 +735,7 @@ class MovingTargetDefense(app_manager.RyuApp):
                 ipv4_dst=src_vip
             )
             actions_vip_reply = [
-                parser.OFPActionSetField(ipv4_src=dst_vip),  # Keep source as VIP
+                parser.OFPActionSetField(ipv4_src=dst_real),  # Restore source to real IP for host compatibility
                 parser.OFPActionSetField(ipv4_dst=src_real),  # Translate destination to real for h1 to accept
                 parser.OFPActionSetField(eth_src=dst_vip_mac),
                 parser.OFPActionSetField(eth_dst=src_real_mac),
@@ -732,17 +758,27 @@ class MovingTargetDefense(app_manager.RyuApp):
 
         src_vip = self.primary_vip.get(src_real)
         if not src_vip:
+            out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
             return
 
         real_dst = self.vip_owner.get(dst_vip)
         if not real_dst:
+            out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
             return
+
+        now_pkt = time()
+        self.vip_last_seen[src_vip] = now_pkt
+        self.vip_last_seen[dst_vip] = now_pkt
 
         src_vip_mac = self.vip_mac_map.get(src_vip)
         dst_real_mac = self.host_ip_to_mac.get(real_dst)
         dst_vip_mac = self.vip_mac_map.get(dst_vip)
 
         if not src_vip_mac or not dst_real_mac or not dst_vip_mac:
+            out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
             return
 
         # Install flow: src_real -> dst_vip becomes src_vip -> real_dst
@@ -782,7 +818,7 @@ class MovingTargetDefense(app_manager.RyuApp):
                 ipv4_dst=src_vip
             )
             actions_rev = [
-                parser.OFPActionSetField(ipv4_src=dst_vip),  # Reverse SNAT: real -> VIP
+                parser.OFPActionSetField(ipv4_src=real_dst),  # Keep source as real IP for host TCP/UDP compatibility
                 parser.OFPActionSetField(ipv4_dst=src_real),  # Reverse DNAT: VIP -> real
                 parser.OFPActionSetField(eth_src=dst_vip_mac),
                 parser.OFPActionSetField(eth_dst=src_real_mac),
@@ -802,10 +838,20 @@ class MovingTargetDefense(app_manager.RyuApp):
 
         real_src = self.vip_owner.get(src_vip)
         if not real_src:
+            out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
             return
+
+        now_pkt = time()
+        self.vip_last_seen[src_vip] = now_pkt
+        dst_vip = self.primary_vip.get(dst_real)
+        if dst_vip:
+            self.vip_last_seen[dst_vip] = now_pkt
 
         dst_real_mac = self.host_ip_to_mac.get(dst_real)
         if not dst_real_mac:
+            out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
             return
 
         # Install flow: src_vip -> dst_real becomes real_src -> dst_real
@@ -860,10 +906,24 @@ class MovingTargetDefense(app_manager.RyuApp):
 
         real_dst = self.vip_owner.get(dst_vip)
         if not real_dst:
+            out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
+            return
+
+        now_pkt = time()
+        self.vip_last_seen[src_vip] = now_pkt
+        self.vip_last_seen[dst_vip] = now_pkt
+
+        dst_vip_mac = self.vip_mac_map.get(dst_vip)
+        if not dst_vip_mac:
+            out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
             return
 
         dst_real_mac = self.host_ip_to_mac.get(real_dst)
         if not dst_real_mac:
+            out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
             return
 
         # Install flow: src_vip -> dst_vip becomes src_vip -> real_dst
@@ -902,7 +962,7 @@ class MovingTargetDefense(app_manager.RyuApp):
                     ipv4_dst=src_vip
                 )
                 actions_rev = [
-                    parser.OFPActionSetField(ipv4_src=dst_vip),  # Reverse SNAT: real -> VIP
+                    parser.OFPActionSetField(ipv4_src=real_dst),  # Keep source as real IP for host TCP/UDP compatibility
                     parser.OFPActionSetField(ipv4_dst=src_vip),  # Keep destination as VIP
                     parser.OFPActionSetField(eth_src=dst_vip_mac),
                     # Forwarding is to real_src's attachment port, so destination MAC must be
