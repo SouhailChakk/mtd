@@ -500,7 +500,7 @@ class MovingTargetDefense(app_manager.RyuApp):
         cookie = msg.cookie
         
         # Check if this cookie corresponds to a VIP (has COOKIE_BASE prefix)
-        if (cookie & ~self.COOKIE_VIP_MASK) != self.COOKIE_BASE:
+        if (cookie & 0xFFFF000000000000) != self.COOKIE_BASE:
             return
 
         # Resolve VIP from cookie lower bits (VIP identity), session bits are ignored.
