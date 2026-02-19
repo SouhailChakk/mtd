@@ -109,9 +109,23 @@ class MovingTargetDefense(app_manager.RyuApp):
                 self.vip_active_sessions.discard(vip)
                 self.logger.info("IDLE: VIP %s marked as idle (no active flows)", vip)
         
-        # Enforce strict policy: any GRACE VIP that is idle is reclaimed immediately.
-        for vip in list(self.vip_grace_until):
-            self._reclaim_grace_vip_if_idle(vip)
+        # Reclaim VIPs in grace period that have expired (only if truly idle and no active sessions)
+        for vip, grace_until in list(self.vip_grace_until.items()):
+            if now >= grace_until:
+                # Check if VIP is idle (no active sessions)
+                flow_count = self.vip_flow_count.get(vip, 0)
+                is_idle = (vip not in self.vip_active_sessions) or (flow_count == 0)
+                
+                if is_idle:
+                    # VIP is idle in GRACE, delete flows immediately and reclaim
+                    self.logger.info("GRACE_IDLE: VIP %s is idle in GRACE, deleting flows and reclaiming", vip)
+                    self._delete_flows_by_cookie(vip)
+                    # Clear flow count since we're deleting flows
+                    self.vip_flow_count.pop(vip, None)
+                    self._reclaim_vip(vip)
+                else:
+                    # Still active, keep it
+                    self.logger.debug("KEEP GRACE: VIP %s still active (%d flows), preserving", vip, flow_count)
         # Log VIP pools
         self._log_vip_pools(now)
 
@@ -145,24 +159,6 @@ class MovingTargetDefense(app_manager.RyuApp):
 
     def _vip_cookie(self, vip: str) -> int:
         return self.COOKIE_BASE | (self._ip_to_int(vip) & self.COOKIE_VIP_MASK)
-
-    def _reclaim_grace_vip_if_idle(self, vip: str) -> bool:
-        """Immediately reclaim a GRACE VIP when it has no active flows."""
-        if vip not in self.vip_grace_until:
-            return False
-
-        flow_count = self.vip_flow_count.get(vip, 0)
-        is_idle = (vip not in self.vip_active_sessions) or (flow_count == 0)
-        if not is_idle:
-            self.logger.debug("KEEP GRACE: VIP %s still active (%d flows), preserving", vip, flow_count)
-            return False
-
-        self.logger.info("GRACE_IDLE: VIP %s is idle in GRACE, deleting flows and reclaiming immediately", vip)
-        self._delete_flows_by_cookie(vip)
-        self.vip_flow_count.pop(vip, None)
-        self.vip_active_sessions.discard(vip)
-        self._reclaim_vip(vip)
-        return True
 
     def _delete_flows_by_cookie(self, vip: str):
         """Delete all flows for a VIP by matching cookie."""
@@ -471,7 +467,21 @@ class MovingTargetDefense(app_manager.RyuApp):
         # Only remove from active_sessions when ALL flows for this VIP expire
         if remaining == 0:
             self.logger.info("FLOW_REMOVED: VIP %s all flows expired, marking as inactive", vip)
-            self._reclaim_grace_vip_if_idle(vip)
+
+            # Check if VIP should be reclaimed (past grace period and no active sessions)
+            now = time()
+            if vip in self.vip_grace_until:
+                grace_until = self.vip_grace_until[vip]
+                if now >= grace_until:
+                    last_seen = self.vip_last_seen.get(vip, grace_until - self.GRACE_PERIOD)
+                    idle_time = now - last_seen
+                    if idle_time > self.GRACE_PERIOD:
+                        self.logger.info("FLOW_REMOVED: Reclaiming VIP %s (grace expired %.1fs ago, no active sessions)",
+                                         vip, idle_time)
+                        self._reclaim_vip(vip)
+                    else:
+                        self.logger.debug("FLOW_REMOVED: VIP %s still in grace (idle %.1fs < %.1fs)",
+                                          vip, idle_time, self.GRACE_PERIOD)
 
     # ---------------- VIP reclamation ----------------
 
@@ -522,6 +532,23 @@ class MovingTargetDefense(app_manager.RyuApp):
 
         self.mac_to_port.setdefault(dpid, {})
         self.mac_to_port[dpid][eth.src] = in_port
+        
+        # Enhanced MAC learning from ARP replies (CRITICAL for efficiency)
+        arp_pkt = pkt.get_protocol(arp.arp)
+        if arp_pkt and arp_pkt.opcode == arp.ARP_REPLY:
+            # ARP reply source = the host that replied (this is what we want to learn)
+            reply_src_mac = arp_pkt.src_mac  # MAC of host that sent the reply
+            reply_src_ip = arp_pkt.src_ip    # IP of host that sent the reply
+            
+            # Learn the MAC and port of the replying host
+            if reply_src_ip in self.detected_hosts:
+                self.mac_to_port[dpid][reply_src_mac] = in_port
+                # Ensure host_ip_to_mac is updated (critical for flow installation)
+                if reply_src_ip not in self.host_ip_to_mac:
+                    self.host_ip_to_mac[reply_src_ip] = reply_src_mac
+                    self.host_mac_to_ip[reply_src_mac] = reply_src_ip
+                self.logger.debug("MAC_LEARN: Learned %s (host %s) -> port %d from ARP reply", 
+                                 reply_src_mac, reply_src_ip, in_port)
 
         # Handle ARP
         arp_pkt = pkt.get_protocol(arp.arp)
@@ -614,6 +641,10 @@ class MovingTargetDefense(app_manager.RyuApp):
                             dp, eth.src, vip_mac, target_ip, arp_pkt.src_ip, in_port
                         )
                         self.logger.debug("ARP: replied real %s with VIP MAC %s", target_ip, vip_mac)
+                        # CRITICAL: When we reply to ARP, we should also ensure the target host's
+                        # real MAC is learned (if not already). This happens when the target host
+                        # sends packets, but we can't rely on that timing.
+                        # The real MAC will be learned when the target host sends its own packets.
                 return
 
             # Unknown destination host: do not drop ARP discovery traffic.
@@ -646,9 +677,21 @@ class MovingTargetDefense(app_manager.RyuApp):
         src_vip_mac = self.vip_mac_map.get(src_vip)
         dst_real_mac = self.host_ip_to_mac.get(dst_real)
 
-        if not src_vip_mac or not dst_real_mac:
-            self.logger.warning("REAL-TO-REAL: Missing MAC for translation")
+        if not src_vip_mac:
+            self.logger.warning("REAL-TO-REAL: Missing VIP MAC for src_vip=%s", src_vip)
             out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
+            return
+        
+        # CRITICAL: If destination MAC not learned yet, the host hasn't sent packets yet
+        # This is a timing issue - proactive discovery should have learned it, but if not,
+        # we need to wait for the host to send a packet. For now, forward the packet as-is
+        # and it will trigger the host to send a reply, which will allow us to learn its MAC
+        if not dst_real_mac:
+            self.logger.warning("REAL-TO-REAL: Destination MAC not learned for %s - host hasn't sent packets yet. Forwarding to trigger learning.", dst_real)
+            # Forward packet as-is - when destination replies, we'll learn its MAC via _learn_host
+            # Note: This packet might not work (uses VIP MAC), but the reply will trigger learning
+            out_port = ofp.OFPP_FLOOD
             self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
             return
 
@@ -666,12 +709,23 @@ class MovingTargetDefense(app_manager.RyuApp):
             self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
             return
         
+        # Determine output port for destination
+        # CRITICAL: Only use specific port if we've learned it from a packet FROM that MAC
+        # Otherwise, use FLOOD to ensure packet delivery
+        dst_port = self.mac_to_port.get(dpid, {}).get(dst_real_mac, None)
+        if dst_port is None:
+            # Destination MAC not learned yet - always use FLOOD
+            # This ensures packets are delivered even if MAC learning hasn't happened yet
+            dst_port = ofp.OFPP_FLOOD
+            self.logger.debug("REAL-TO-REAL: Destination MAC %s not learned, using FLOOD for %s -> %s",
+                             dst_real_mac, src_real, dst_real)
+        
         actions = [
             parser.OFPActionSetField(ipv4_src=src_vip),  # SNAT: real -> VIP (source uses VIP)
             parser.OFPActionSetField(ipv4_dst=dst_real),  # Keep destination as real IP (h2 needs to accept it)
             parser.OFPActionSetField(eth_src=src_vip_mac),  # Source MAC is VIP MAC
             parser.OFPActionSetField(eth_dst=dst_real_mac),  # Destination MAC is real host MAC
-            parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(dst_real_mac, ofp.OFPP_FLOOD))
+            parser.OFPActionOutput(dst_port)
         ]
         # CRITICAL: Update vip_last_seen for BOTH VIPs before sending packet
         # This ensures both source and destination VIPs are tracked as active
@@ -702,12 +756,22 @@ class MovingTargetDefense(app_manager.RyuApp):
                 ipv4_src=dst_real,
                 ipv4_dst=src_real
             )
+            # Determine output port for source (reverse direction)
+            # CRITICAL: Only use specific port if we've learned it from a packet FROM that MAC
+            # Otherwise, use FLOOD to ensure packet delivery
+            src_port = self.mac_to_port.get(dpid, {}).get(src_real_mac, None)
+            if src_port is None:
+                # Source MAC not learned yet - always use FLOOD
+                src_port = ofp.OFPP_FLOOD
+                self.logger.debug("REAL-TO-REAL: Source MAC %s not learned for reverse flow, using FLOOD for %s -> %s",
+                                 src_real_mac, dst_real, src_real)
+            
             actions_rev = [
                 parser.OFPActionSetField(ipv4_src=dst_real),  # Keep source as real IP for host TCP/UDP compatibility
                 parser.OFPActionSetField(ipv4_dst=src_real),  # Keep destination as real IP (h1 needs to accept it)
                 parser.OFPActionSetField(eth_src=dst_vip_mac),  # Source MAC is VIP MAC
                 parser.OFPActionSetField(eth_dst=src_real_mac),  # Destination MAC is real host MAC
-                parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD))
+                parser.OFPActionOutput(src_port)
             ]
             self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
                           cookie=self._vip_cookie(dst_vip), idle_timeout=60)
