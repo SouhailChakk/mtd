@@ -11,6 +11,7 @@ Design goals:
 - Keep table-miss to controller and ARP VIP replies.
 """
 
+import zlib
 from time import time
 from typing import Dict, List, Optional, Set
 
@@ -43,6 +44,8 @@ class MovingTargetDefense(app_manager.RyuApp):
     FLOW_PRIORITY_VIP = 100
     COOKIE_BASE = 0xA000_0000_0000_0000
     COOKIE_VIP_MASK = 0xFFFF_FFFF
+    COOKIE_SESSION_MASK = 0x0000_FFFF_0000_0000
+    CONTROLLER_DISCOVERY_MAC = "02:00:00:00:00:fe"
 
     VIP_STATE_PRIMARY = "PRIMARY"
     VIP_STATE_GRACE = "GRACE"
@@ -160,6 +163,48 @@ class MovingTargetDefense(app_manager.RyuApp):
     def _vip_cookie(self, vip: str) -> int:
         return self.COOKIE_BASE | (self._ip_to_int(vip) & self.COOKIE_VIP_MASK)
 
+    def _cookie_vip_ip(self, cookie: int) -> str:
+        vip_int = cookie & self.COOKIE_VIP_MASK
+        return ".".join([
+            str((vip_int >> 24) & 0xFF),
+            str((vip_int >> 16) & 0xFF),
+            str((vip_int >> 8) & 0xFF),
+            str(vip_int & 0xFF),
+        ])
+
+    def _session_cookie(self, vip: str, pkt, ip4, direction: str) -> int:
+        """Cookie with VIP identity + per-session entropy."""
+        signature = [direction, ip4.src, ip4.dst, str(ip4.proto)]
+        tcp_pkt = pkt.get_protocol(tcp.tcp)
+        udp_pkt = pkt.get_protocol(udp.udp)
+        icmp_pkt = pkt.get_protocol(icmp.icmp)
+        if tcp_pkt:
+            signature.extend(["tcp", str(tcp_pkt.src_port), str(tcp_pkt.dst_port)])
+        elif udp_pkt:
+            signature.extend(["udp", str(udp_pkt.src_port), str(udp_pkt.dst_port)])
+        elif icmp_pkt:
+            signature.extend(["icmp", str(icmp_pkt.type), str(icmp_pkt.code)])
+        session_hash = zlib.crc32("|".join(signature).encode()) & 0xFFFF
+        return self._vip_cookie(vip) | (session_hash << 32)
+
+    def _build_ip_match(self, parser, pkt, src_ip: str, dst_ip: str, reverse: bool = False):
+        kwargs = {"eth_type": 0x0800, "ipv4_src": src_ip, "ipv4_dst": dst_ip}
+        tcp_pkt = pkt.get_protocol(tcp.tcp)
+        udp_pkt = pkt.get_protocol(udp.udp)
+        icmp_pkt = pkt.get_protocol(icmp.icmp)
+        if tcp_pkt:
+            src_port = tcp_pkt.dst_port if reverse else tcp_pkt.src_port
+            dst_port = tcp_pkt.src_port if reverse else tcp_pkt.dst_port
+            kwargs.update({"ip_proto": 6, "tcp_src": src_port, "tcp_dst": dst_port})
+        elif udp_pkt:
+            src_port = udp_pkt.dst_port if reverse else udp_pkt.src_port
+            dst_port = udp_pkt.src_port if reverse else udp_pkt.dst_port
+            kwargs.update({"ip_proto": 17, "udp_src": src_port, "udp_dst": dst_port})
+        elif icmp_pkt:
+            icmp_type = 0 if reverse and icmp_pkt.type == 8 else icmp_pkt.type
+            kwargs.update({"ip_proto": 1, "icmpv4_type": icmp_type, "icmpv4_code": icmp_pkt.code})
+        return parser.OFPMatch(**kwargs)
+
     def _delete_flows_by_cookie(self, vip: str):
         """Delete all flows for a VIP by matching cookie."""
         cookie = self._vip_cookie(vip)
@@ -204,6 +249,13 @@ class MovingTargetDefense(app_manager.RyuApp):
             buffer_id=buffer_id,
         )
         dp.send_msg(mod)
+
+    def _track_flow_cookie(self, cookie: int):
+        """Track active flow counters using the VIP encoded in cookie."""
+        vip = self._cookie_vip_ip(cookie)
+        if vip in self.vip_owner:
+            self.vip_active_sessions.add(vip)
+            self.vip_flow_count[vip] = self.vip_flow_count.get(vip, 0) + 1
 
     def _take_resource_vip(self) -> Optional[str]:
         """Take a VIP from the resource pool."""
@@ -328,6 +380,32 @@ class MovingTargetDefense(app_manager.RyuApp):
             data=p.data
         ))
 
+    def _send_arp_request(self, dp, target_ip: str):
+        """Send ARP request for a real host to accelerate MAC learning."""
+        parser = dp.ofproto_parser
+        ofp = dp.ofproto
+        p = packet.Packet()
+        p.add_protocol(ethernet.ethernet(
+            ethertype=0x0806,
+            dst='ff:ff:ff:ff:ff:ff',
+            src=self.CONTROLLER_DISCOVERY_MAC
+        ))
+        p.add_protocol(arp.arp(
+            opcode=arp.ARP_REQUEST,
+            src_mac=self.CONTROLLER_DISCOVERY_MAC,
+            src_ip='10.0.0.254',
+            dst_mac='00:00:00:00:00:00',
+            dst_ip=target_ip
+        ))
+        p.serialize()
+        dp.send_msg(parser.OFPPacketOut(
+            datapath=dp,
+            buffer_id=ofp.OFP_NO_BUFFER,
+            in_port=ofp.OFPP_CONTROLLER,
+            actions=[parser.OFPActionOutput(ofp.OFPP_FLOOD)],
+            data=p.data
+        ))
+
     def _proactive_discovery(self, now: float):
         """Proactively send ARP requests to discover hosts."""
         if not self.datapaths:
@@ -361,11 +439,11 @@ class MovingTargetDefense(app_manager.RyuApp):
                     p.add_protocol(ethernet.ethernet(
                         ethertype=0x0806,
                         dst='ff:ff:ff:ff:ff:ff',
-                        src='00:00:00:00:00:00'
+                        src=self.CONTROLLER_DISCOVERY_MAC
                     ))
                     p.add_protocol(arp.arp(
                         opcode=arp.ARP_REQUEST,
-                        src_mac='00:00:00:00:00:00',
+                        src_mac=self.CONTROLLER_DISCOVERY_MAC,
                         src_ip='10.0.0.254',  # Controller IP
                         dst_mac='00:00:00:00:00:00',
                         dst_ip=target_ip
@@ -434,17 +512,13 @@ class MovingTargetDefense(app_manager.RyuApp):
         cookie = msg.cookie
         
         # Check if this cookie corresponds to a VIP (has COOKIE_BASE prefix)
-        if (cookie & ~self.COOKIE_VIP_MASK) != self.COOKIE_BASE:
+        if (cookie & 0xFFFF000000000000) != self.COOKIE_BASE:
             return
 
-        # Resolve VIP from cookie directly, independent of active_sessions state.
-        vip = None
-        for candidate_vip in self.vip_owner:
-            if self._vip_cookie(candidate_vip) == cookie:
-                vip = candidate_vip
-                break
+        # Resolve VIP from cookie lower bits (VIP identity), session bits are ignored.
+        vip = self._cookie_vip_ip(cookie)
 
-        if not vip:
+        if vip not in self.vip_owner:
             return
 
         # Decrement flow count for this VIP (never negative).
@@ -688,20 +762,23 @@ class MovingTargetDefense(app_manager.RyuApp):
         # we need to wait for the host to send a packet. For now, forward the packet as-is
         # and it will trigger the host to send a reply, which will allow us to learn its MAC
         if not dst_real_mac:
-            self.logger.warning("REAL-TO-REAL: Destination MAC not learned for %s - host hasn't sent packets yet. Forwarding to trigger learning.", dst_real)
-            # Forward packet as-is - when destination replies, we'll learn its MAC via _learn_host
-            # Note: This packet might not work (uses VIP MAC), but the reply will trigger learning
-            out_port = ofp.OFPP_FLOOD
-            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
+            self.logger.warning("REAL-TO-REAL: Destination MAC unknown for %s, sending ARP probe and using broadcast fallback", dst_real)
+            self._send_arp_request(dp, dst_real)
+            # Fallback: send translated packet with broadcast L2 dst so the real host can still
+            # receive it while MAC learning converges.
+            actions = [
+                parser.OFPActionSetField(ipv4_src=src_vip),
+                parser.OFPActionSetField(ipv4_dst=dst_real),
+                parser.OFPActionSetField(eth_src=src_vip_mac),
+                parser.OFPActionSetField(eth_dst='ff:ff:ff:ff:ff:ff'),
+                parser.OFPActionOutput(ofp.OFPP_FLOOD),
+            ]
+            self._send_packet_out(msg, dp, in_port, actions)
             return
 
         # Install forward flow: src_real -> dst_real becomes src_vip -> dst_vip
         # This ensures VIPs communicate on the wire, not real IPs
-        match = parser.OFPMatch(
-            eth_type=0x0800,
-            ipv4_src=src_real,
-            ipv4_dst=dst_real
-        )
+        match = self._build_ip_match(parser, pkt, src_real, dst_real)
         dst_vip_mac = self.vip_mac_map.get(dst_vip)
         if not dst_vip_mac:
             self.logger.warning("REAL-TO-REAL: Missing VIP MAC for dst_vip=%s", dst_vip)
@@ -738,24 +815,17 @@ class MovingTargetDefense(app_manager.RyuApp):
         # This ensures TCP SYN and other first packets are sent immediately
         self._send_packet_out(msg, dp, in_port, actions)
         # Now install flow for subsequent packets
+        cookie_fwd = self._session_cookie(src_vip, pkt, ip4, "fwd")
         self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
-                      cookie=self._vip_cookie(src_vip), idle_timeout=60)
-        # Mark both VIPs as having active session and increment flow count
-        self.vip_active_sessions.add(src_vip)
-        self.vip_active_sessions.add(dst_vip)
-        self.vip_flow_count[src_vip] = self.vip_flow_count.get(src_vip, 0) + 1
-        self.vip_flow_count[dst_vip] = self.vip_flow_count.get(dst_vip, 0) + 1
+                      cookie=cookie_fwd, idle_timeout=60)
+        self._track_flow_cookie(cookie_fwd)
 
         # Install reverse flow: dst_real -> src_real becomes dst_vip -> src_real
         # When h2 replies, it sends from dst_real to src_real, translate source to VIP
         src_real_mac = self.host_ip_to_mac.get(src_real)
         if src_real_mac:
             # Flow 1: Match h2's reply (real2 -> real1), translate source to VIP2
-            match_rev = parser.OFPMatch(
-                eth_type=0x0800,
-                ipv4_src=dst_real,
-                ipv4_dst=src_real
-            )
+            match_rev = self._build_ip_match(parser, pkt, dst_real, src_real, reverse=True)
             # Determine output port for source (reverse direction)
             # CRITICAL: Only use specific port if we've learned it from a packet FROM that MAC
             # Otherwise, use FLOOD to ensure packet delivery
@@ -773,21 +843,14 @@ class MovingTargetDefense(app_manager.RyuApp):
                 parser.OFPActionSetField(eth_dst=src_real_mac),  # Destination MAC is real host MAC
                 parser.OFPActionOutput(src_port)
             ]
+            cookie_rev = self._session_cookie(dst_vip, pkt, ip4, "rev")
             self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
-                          cookie=self._vip_cookie(dst_vip), idle_timeout=60)
-            # Mark both VIPs as having active session and increment flow count
-            self.vip_active_sessions.add(src_vip)
-            self.vip_active_sessions.add(dst_vip)
-            self.vip_flow_count[src_vip] = self.vip_flow_count.get(src_vip, 0) + 1
-            self.vip_flow_count[dst_vip] = self.vip_flow_count.get(dst_vip, 0) + 1
+                          cookie=cookie_rev, idle_timeout=60)
+            self._track_flow_cookie(cookie_rev)
             
             # Flow 2: Also handle case where h2 might reply to VIP1 directly (if it saw VIP1 as source)
             # Match VIP2 -> VIP1 (on wire), translate to VIP2 -> real1 for delivery
-            match_vip_reply = parser.OFPMatch(
-                eth_type=0x0800,
-                ipv4_src=dst_vip,
-                ipv4_dst=src_vip
-            )
+            match_vip_reply = self._build_ip_match(parser, pkt, dst_vip, src_vip, reverse=True)
             actions_vip_reply = [
                 parser.OFPActionSetField(ipv4_src=dst_real),  # Restore source to real IP for host compatibility
                 parser.OFPActionSetField(ipv4_dst=src_real),  # Translate destination to real for h1 to accept
@@ -795,12 +858,10 @@ class MovingTargetDefense(app_manager.RyuApp):
                 parser.OFPActionSetField(eth_dst=src_real_mac),
                 parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD))
             ]
+            cookie_vip_reply = self._session_cookie(dst_vip, pkt, ip4, "rev")
             self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_vip_reply, actions=actions_vip_reply,
-                          cookie=self._vip_cookie(dst_vip), idle_timeout=60)
-            self.vip_active_sessions.add(src_vip)
-            self.vip_active_sessions.add(dst_vip)
-            self.vip_flow_count[src_vip] = self.vip_flow_count.get(src_vip, 0) + 1
-            self.vip_flow_count[dst_vip] = self.vip_flow_count.get(dst_vip, 0) + 1
+                          cookie=cookie_vip_reply, idle_timeout=60)
+            self._track_flow_cookie(cookie_vip_reply)
 
         self.logger.debug("REAL-TO-REAL: %s -> %s (translated to %s -> %s, source VIP active)",
                          src_real, dst_real, src_vip, dst_real)
@@ -836,11 +897,7 @@ class MovingTargetDefense(app_manager.RyuApp):
             return
 
         # Install flow: src_real -> dst_vip becomes src_vip -> real_dst
-        match = parser.OFPMatch(
-            eth_type=0x0800,
-            ipv4_src=src_real,
-            ipv4_dst=dst_vip
-        )
+        match = self._build_ip_match(parser, pkt, src_real, dst_vip)
         actions = [
             parser.OFPActionSetField(ipv4_src=src_vip),
             parser.OFPActionSetField(ipv4_dst=real_dst),
@@ -856,21 +913,15 @@ class MovingTargetDefense(app_manager.RyuApp):
         # CRITICAL: Send packet out FIRST for TCP SYN and other first packets
         self._send_packet_out(msg, dp, in_port, actions)
         # Now install flow for subsequent packets
+        cookie_fwd = self._session_cookie(src_vip, pkt, ip4, "fwd")
         self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
-                      cookie=self._vip_cookie(src_vip), idle_timeout=60)
-        self.vip_active_sessions.add(src_vip)
-        self.vip_active_sessions.add(dst_vip)
-        self.vip_flow_count[src_vip] = self.vip_flow_count.get(src_vip, 0) + 1
-        self.vip_flow_count[dst_vip] = self.vip_flow_count.get(dst_vip, 0) + 1
+                      cookie=cookie_fwd, idle_timeout=60)
+        self._track_flow_cookie(cookie_fwd)
 
         # Install reverse flow: real_dst -> src_vip becomes dst_vip -> src_real
         src_real_mac = self.host_ip_to_mac.get(src_real)
         if src_real_mac:
-            match_rev = parser.OFPMatch(
-                eth_type=0x0800,
-                ipv4_src=real_dst,
-                ipv4_dst=src_vip
-            )
+            match_rev = self._build_ip_match(parser, pkt, real_dst, src_vip, reverse=True)
             actions_rev = [
                 parser.OFPActionSetField(ipv4_src=real_dst),  # Keep source as real IP for host TCP/UDP compatibility
                 parser.OFPActionSetField(ipv4_dst=src_real),  # Reverse DNAT: VIP -> real
@@ -878,12 +929,10 @@ class MovingTargetDefense(app_manager.RyuApp):
                 parser.OFPActionSetField(eth_dst=src_real_mac),
                 parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD))
             ]
+            cookie_rev = self._session_cookie(dst_vip, pkt, ip4, "rev")
             self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
-                          cookie=self._vip_cookie(dst_vip), idle_timeout=60)
-            self.vip_active_sessions.add(src_vip)
-            self.vip_active_sessions.add(dst_vip)
-            self.vip_flow_count[src_vip] = self.vip_flow_count.get(src_vip, 0) + 1
-            self.vip_flow_count[dst_vip] = self.vip_flow_count.get(dst_vip, 0) + 1
+                          cookie=cookie_rev, idle_timeout=60)
+            self._track_flow_cookie(cookie_rev)
 
     def _handle_vip_to_real(self, msg, dp, pkt, ip4, eth, in_port, dpid, src_vip, dst_real):
         """Handle traffic from VIP to real host: reverse SNAT (translate source VIP to real IP)."""
@@ -909,11 +958,7 @@ class MovingTargetDefense(app_manager.RyuApp):
             return
 
         # Install flow: src_vip -> dst_real becomes real_src -> dst_real
-        match = parser.OFPMatch(
-            eth_type=0x0800,
-            ipv4_src=src_vip,
-            ipv4_dst=dst_real
-        )
+        match = self._build_ip_match(parser, pkt, src_vip, dst_real)
         actions = [
             parser.OFPActionSetField(ipv4_src=real_src),  # Reverse SNAT: VIP -> real
             parser.OFPActionSetField(eth_dst=dst_real_mac),
@@ -926,19 +971,15 @@ class MovingTargetDefense(app_manager.RyuApp):
         # CRITICAL: Send packet out FIRST for TCP SYN and other first packets
         self._send_packet_out(msg, dp, in_port, actions)
         # Now install flow for subsequent packets
+        cookie_fwd = self._session_cookie(src_vip, pkt, ip4, "fwd")
         self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
-                      cookie=self._vip_cookie(src_vip), idle_timeout=60)
-        self.vip_active_sessions.add(src_vip)
-        self.vip_flow_count[src_vip] = self.vip_flow_count.get(src_vip, 0) + 1
+                      cookie=cookie_fwd, idle_timeout=60)
+        self._track_flow_cookie(cookie_fwd)
 
         # Install reverse flow: dst_real -> real_src becomes dst_real -> src_vip
         src_real_mac = self.host_ip_to_mac.get(real_src)
         if src_real_mac:
-            match_rev = parser.OFPMatch(
-                eth_type=0x0800,
-                ipv4_src=dst_real,
-                ipv4_dst=real_src
-            )
+            match_rev = self._build_ip_match(parser, pkt, dst_real, real_src, reverse=True)
             src_vip_mac = self.vip_mac_map.get(src_vip)
             if src_vip_mac:
                 actions_rev = [
@@ -948,10 +989,10 @@ class MovingTargetDefense(app_manager.RyuApp):
                     parser.OFPActionSetField(eth_dst=src_real_mac),
                     parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD))
                 ]
+                cookie_rev = self._session_cookie(src_vip, pkt, ip4, "rev")
                 self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
-                              cookie=self._vip_cookie(src_vip), idle_timeout=60)
-                self.vip_active_sessions.add(src_vip)
-                self.vip_flow_count[src_vip] = self.vip_flow_count.get(src_vip, 0) + 1
+                              cookie=cookie_rev, idle_timeout=60)
+                self._track_flow_cookie(cookie_rev)
 
     def _handle_vip_to_vip(self, msg, dp, pkt, ip4, eth, in_port, dpid, src_vip, dst_vip):
         """Handle traffic between VIPs: already translated, just forward."""
@@ -981,11 +1022,7 @@ class MovingTargetDefense(app_manager.RyuApp):
             return
 
         # Install flow: src_vip -> dst_vip becomes src_vip -> real_dst
-        match = parser.OFPMatch(
-            eth_type=0x0800,
-            ipv4_src=src_vip,
-            ipv4_dst=dst_vip
-        )
+        match = self._build_ip_match(parser, pkt, src_vip, dst_vip)
         actions = [
             parser.OFPActionSetField(ipv4_dst=real_dst),
             parser.OFPActionSetField(eth_dst=dst_real_mac),
@@ -999,10 +1036,10 @@ class MovingTargetDefense(app_manager.RyuApp):
         # CRITICAL: Send packet out FIRST for TCP SYN and other first packets
         self._send_packet_out(msg, dp, in_port, actions)
         # Now install flow for subsequent packets
+        cookie_fwd = self._session_cookie(dst_vip, pkt, ip4, "fwd")
         self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
-                      cookie=self._vip_cookie(dst_vip), idle_timeout=60)
-        self.vip_active_sessions.add(dst_vip)
-        self.vip_flow_count[dst_vip] = self.vip_flow_count.get(dst_vip, 0) + 1
+                      cookie=cookie_fwd, idle_timeout=60)
+        self._track_flow_cookie(cookie_fwd)
 
         # Install reverse flow: real_dst -> src_vip becomes dst_vip -> src_vip
         real_src = self.vip_owner.get(src_vip)
@@ -1010,11 +1047,7 @@ class MovingTargetDefense(app_manager.RyuApp):
             src_real_mac = self.host_ip_to_mac.get(real_src)
             src_vip_mac = self.vip_mac_map.get(src_vip)
             if src_real_mac and src_vip_mac:
-                match_rev = parser.OFPMatch(
-                    eth_type=0x0800,
-                    ipv4_src=real_dst,
-                    ipv4_dst=src_vip
-                )
+                match_rev = self._build_ip_match(parser, pkt, real_dst, src_vip, reverse=True)
                 actions_rev = [
                     parser.OFPActionSetField(ipv4_src=real_dst),  # Keep source as real IP for host TCP/UDP compatibility
                     parser.OFPActionSetField(ipv4_dst=src_vip),  # Keep destination as VIP
@@ -1024,12 +1057,10 @@ class MovingTargetDefense(app_manager.RyuApp):
                     parser.OFPActionSetField(eth_dst=src_real_mac),
                     parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD))
                 ]
+                cookie_rev = self._session_cookie(src_vip, pkt, ip4, "rev")
                 self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
-                              cookie=self._vip_cookie(src_vip), idle_timeout=60)
-                self.vip_active_sessions.add(src_vip)
-                self.vip_active_sessions.add(dst_vip)
-                self.vip_flow_count[src_vip] = self.vip_flow_count.get(src_vip, 0) + 1
-                self.vip_flow_count[dst_vip] = self.vip_flow_count.get(dst_vip, 0) + 1
+                              cookie=cookie_rev, idle_timeout=60)
+                self._track_flow_cookie(cookie_rev)
 
     def _forward_packet(self, msg, dp, in_port, dpid, dst_mac, out_port):
         """Forward packet without modification."""
