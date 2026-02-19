@@ -18,7 +18,7 @@ from ryu.base import app_manager
 from ryu.controller import event, ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
 from ryu.lib import hub
-from ryu.lib.packet import arp, ethernet, ipv4, packet
+from ryu.lib.packet import arp, ethernet, icmp, ipv4, packet, tcp, udp
 from ryu.ofproto import ofproto_v1_3
 
 
@@ -659,12 +659,15 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             parser.OFPActionOutput(dst_port)
         ]
 
-        # Simple match: src=real, dst=real
+        forward_l4_match, reverse_l4_match = self._extract_l4_match_fields(pkt, ip4)
+
+        # Protocol-aware match: src=real, dst=real + L4 fields when available
         match = parser.OFPMatch(
             eth_type=0x0800,
             ipv4_src=src_real,
             ipv4_dst=dst_real,
-            in_port=in_port
+            in_port=in_port,
+            **forward_l4_match,
         )
 
         self._send_packet_out(msg, dp, in_port, actions)
@@ -685,7 +688,8 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                 eth_type=0x0800,
                 ipv4_src=dst_real,
                 ipv4_dst=src_vip,
-                in_port=in_port
+                in_port=dst_port,
+                **reverse_l4_match,
             )
             cookie_rev = self._vip_cookie(src_vip)
             self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
@@ -735,12 +739,15 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             parser.OFPActionOutput(dst_port)
         ]
 
-        # Simple match: src=real, dst=VIP
+        forward_l4_match, reverse_l4_match = self._extract_l4_match_fields(pkt, ip4)
+
+        # Protocol-aware match: src=real, dst=VIP + L4 fields when available
         match = parser.OFPMatch(
             eth_type=0x0800,
             ipv4_src=src_real,
             ipv4_dst=dst_vip,
-            in_port=in_port
+            in_port=in_port,
+            **forward_l4_match,
         )
         
         self._send_packet_out(msg, dp, in_port, actions)
@@ -761,7 +768,8 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                 eth_type=0x0800,
                 ipv4_src=real_dst,
                 ipv4_dst=src_vip,
-                in_port=in_port
+                in_port=dst_port,
+                **reverse_l4_match,
             )
             cookie_rev = self._vip_cookie(src_vip)
             self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
@@ -796,11 +804,14 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             parser.OFPActionOutput(dst_port)
         ]
 
+        forward_l4_match, _ = self._extract_l4_match_fields(pkt, ip4)
+
         match = parser.OFPMatch(
             eth_type=0x0800,
             ipv4_src=src_vip,
             ipv4_dst=dst_real,
-            in_port=in_port
+            in_port=in_port,
+            **forward_l4_match,
         )
         
         self._send_packet_out(msg, dp, in_port, actions)
@@ -836,17 +847,59 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             parser.OFPActionOutput(dst_port)
         ]
 
+        forward_l4_match, _ = self._extract_l4_match_fields(pkt, ip4)
+
         match = parser.OFPMatch(
             eth_type=0x0800,
             ipv4_src=src_vip,
             ipv4_dst=dst_vip,
-            in_port=in_port
+            in_port=in_port,
+            **forward_l4_match,
         )
         
         self._send_packet_out(msg, dp, in_port, actions)
         cookie = self._vip_cookie(dst_vip)
         self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
                       cookie=cookie, idle_timeout=60)
+
+    def _extract_l4_match_fields(self, pkt, ip4):
+        """Build protocol-aware OpenFlow match fields for forward and reverse directions."""
+        tcp_pkt = pkt.get_protocol(tcp.tcp)
+        if tcp_pkt:
+            return (
+                {"ip_proto": socket.IPPROTO_TCP, "tcp_src": tcp_pkt.src_port, "tcp_dst": tcp_pkt.dst_port},
+                {"ip_proto": socket.IPPROTO_TCP, "tcp_src": tcp_pkt.dst_port, "tcp_dst": tcp_pkt.src_port},
+            )
+
+        udp_pkt = pkt.get_protocol(udp.udp)
+        if udp_pkt:
+            return (
+                {"ip_proto": socket.IPPROTO_UDP, "udp_src": udp_pkt.src_port, "udp_dst": udp_pkt.dst_port},
+                {"ip_proto": socket.IPPROTO_UDP, "udp_src": udp_pkt.dst_port, "udp_dst": udp_pkt.src_port},
+            )
+
+        icmp_pkt = pkt.get_protocol(icmp.icmp)
+        if icmp_pkt:
+            reverse_type = icmp_pkt.type
+            if icmp_pkt.type == icmp.ICMP_ECHO_REQUEST:
+                reverse_type = icmp.ICMP_ECHO_REPLY
+            elif icmp_pkt.type == icmp.ICMP_ECHO_REPLY:
+                reverse_type = icmp.ICMP_ECHO_REQUEST
+
+            return (
+                {
+                    "ip_proto": socket.IPPROTO_ICMP,
+                    "icmpv4_type": icmp_pkt.type,
+                    "icmpv4_code": icmp_pkt.code,
+                },
+                {
+                    "ip_proto": socket.IPPROTO_ICMP,
+                    "icmpv4_type": reverse_type,
+                    "icmpv4_code": icmp_pkt.code,
+                },
+            )
+
+        return ({"ip_proto": ip4.proto}, {"ip_proto": ip4.proto})
 
     def _forward_packet(self, msg, dp, in_port, dpid, dst_mac, out_port):
         """Forward packet without modification."""
