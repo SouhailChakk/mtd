@@ -726,7 +726,10 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         if src_real_mac and dst_vip_mac:
             src_port = self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD)
             actions_rev = [
-                parser.OFPActionSetField(ipv4_src=dst_vip),  # SNAT: real → VIP (for reply)
+                # Keep reply source as the real host IP for TCP/UDP session stability.
+                # If replies are rewritten to VIP here, clients that connected to a real
+                # IP (e.g. `iperf -c h3`) may reject the flow because peer identity flips.
+                parser.OFPActionSetField(ipv4_src=dst_real),
                 parser.OFPActionSetField(ipv4_dst=src_real),  # Keep destination as real IP
                 parser.OFPActionSetField(eth_src=dst_vip_mac),
                 parser.OFPActionSetField(eth_dst=src_real_mac),
@@ -821,7 +824,9 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         if src_real_mac and dst_vip_mac:
             src_port = self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD)
             actions_rev = [
-                parser.OFPActionSetField(ipv4_src=dst_vip),  # SNAT: real → VIP (for reply)
+                # Keep reply source as the real server for stable TCP/UDP sessions when
+                # clients connected via a real destination address.
+                parser.OFPActionSetField(ipv4_src=real_dst),
                 parser.OFPActionSetField(ipv4_dst=src_real),  # Keep destination as real IP
                 parser.OFPActionSetField(eth_src=dst_vip_mac),
                 parser.OFPActionSetField(eth_dst=src_real_mac),
