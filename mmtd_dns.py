@@ -87,6 +87,10 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
 
     def start(self):
         super(MovingTargetDefenseDNS, self).start()
+        if getattr(self, "_workers_started", False):
+            self.logger.warning("START: worker threads already started, skipping duplicate spawn")
+            return
+        self._workers_started = True
         self.threads.append(hub.spawn(self._ticker))
         self.threads.append(hub.spawn(self._rotation_loop))
 
@@ -274,6 +278,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
 
     def _rotation_loop(self):
         while True:
+            self.logger.debug("ROTATE: sleeping for %ss before next primary VIP rotation", self.ROTATE_INTERVAL)
             hub.sleep(self.ROTATE_INTERVAL)
             now = time()
             for host_ip in sorted(self.detected_hosts):
@@ -665,8 +670,8 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.vip_last_seen[src_vip] = now_pkt
         self.vip_last_seen[dst_vip] = now_pkt
 
-        src_vip_mac = self.vip_mac_map.get(src_vip)
-        dst_vip_mac = self.vip_mac_map.get(dst_vip)
+        src_vip_mac = self._ensure_vip_mac(src_vip)
+        dst_vip_mac = self._ensure_vip_mac(dst_vip)
         dst_real_mac = self.host_ip_to_mac.get(dst_real)
 
         if not src_vip_mac:
@@ -710,7 +715,9 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         # When h2 replies, it sends: src=dst_real, dst=src_real (real IPs)
         # We need to match this and translate source to VIP
         # CRITICAL: Reverse flow must be installed with dst_vip cookie to track flow_refs for destination VIP
-        src_real_mac = self.host_ip_to_mac.get(src_real)
+        src_real_mac = self.host_ip_to_mac.get(src_real) or eth.src
+        if src_real_mac:
+            self.host_ip_to_mac[src_real] = src_real_mac
         if not dst_vip_mac:
             self.logger.error("REAL-TO-REAL: Missing dst_vip_mac for %s (dst_vip=%s), cannot install reverse flow! dst VIP flow_refs will not be tracked!", 
                              dst_real, dst_vip)
@@ -765,8 +772,8 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             self._forward_packet(msg, dp, in_port, dpid, eth.dst, ofp.OFPP_FLOOD)
             return
 
-        src_vip_mac = self.vip_mac_map.get(src_vip)
-        dst_vip_mac = self.vip_mac_map.get(dst_vip)
+        src_vip_mac = self._ensure_vip_mac(src_vip)
+        dst_vip_mac = self._ensure_vip_mac(dst_vip)
         dst_real_mac = self.host_ip_to_mac.get(real_dst)
         
         if not src_vip_mac or not dst_real_mac:
@@ -797,14 +804,20 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         )
         
         self._send_packet_out(msg, dp, in_port, actions)
-        cookie = self._vip_cookie(dst_vip)
+        cookie = self._vip_cookie(src_vip)
         self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
                       cookie=cookie, idle_timeout=60)
         
         # Install reverse flow: real_dst → src_real (reply path)
         # When h2 replies, it sends: src=real_dst, dst=src_real (real IPs)
         # We need to match this and translate source to VIP
-        src_real_mac = self.host_ip_to_mac.get(src_real)
+        src_real_mac = self.host_ip_to_mac.get(src_real) or eth.src
+        if src_real_mac:
+            self.host_ip_to_mac[src_real] = src_real_mac
+        if not dst_vip_mac:
+            self.logger.error("REAL-TO-VIP: Missing dst_vip_mac for dst_vip=%s, cannot install reverse flow", dst_vip)
+        if not src_real_mac:
+            self.logger.error("REAL-TO-VIP: Missing src_real_mac for %s, cannot install reverse flow", src_real)
         if src_real_mac and dst_vip_mac:
             src_port = self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD)
             actions_rev = [
@@ -824,7 +837,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             )
             # Reverse flow translates source to dst_vip, so use dst_vip cookie to track flow_refs
             cookie_rev = self._vip_cookie(dst_vip)
-            self.logger.debug("REAL-TO-REAL: Installing reverse flow for dst_vip=%s (cookie=0x%016x) to track flow_refs", 
+            self.logger.debug("REAL-TO-VIP: Installing reverse flow for dst_vip=%s (cookie=0x%016x) to track flow_refs", 
                              dst_vip, cookie_rev)
             self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
                           cookie=cookie_rev, idle_timeout=60)
@@ -951,6 +964,18 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             )
 
         return ({"ip_proto": ip4.proto}, {"ip_proto": ip4.proto})
+
+    def _ensure_vip_mac(self, vip: str) -> Optional[str]:
+        """Return VIP MAC, generating and caching one if missing."""
+        if not vip:
+            return None
+        vip_mac = self.vip_mac_map.get(vip)
+        if vip_mac:
+            return vip_mac
+        vip_mac = self._generate_vip_mac(vip)
+        self.vip_mac_map[vip] = vip_mac
+        self.logger.warning("VIP_MAC: generated missing MAC mapping for VIP %s -> %s", vip, vip_mac)
+        return vip_mac
 
     def _forward_packet(self, msg, dp, in_port, dpid, dst_mac, out_port):
         """Forward packet without modification."""
