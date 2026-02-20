@@ -1,107 +1,1119 @@
-# Prompt for Codex: Fix MTD DNS Controller Issues
+"""
+Simplified Moving Target Defense Ryu controller.
 
-## Context
-I have a DNS-based Moving Target Defense (MTD) Ryu OpenFlow controller (`mtd_dns.py`) that manages Virtual IPs (VIPs) for network hosts. The controller should rotate PRIMARY VIPs every 60 seconds and handle GRACE VIPs properly, but there are critical bugs.
+Design goals:
+- Simple time-based VIP rotation only.
+- VIP state machine: PRIMARY -> GRACE -> RECLAIMED (time driven).
+- No session table / refcount / stats growth logic.
+- Straightforward flow installs visible in OVS:
+  * ip,nw_dst=<vip> rewrite to real host
+  * ip,nw_src=<real> rewrite to host VIP
+- Keep table-miss to controller and ARP VIP replies.
+"""
 
-## Expected Behavior
+import zlib
+from time import time
+from typing import Dict, List, Optional, Set
 
-### VIP Lifecycle
-1. **PRIMARY VIP Rotation**: Every 60 seconds, each host gets a new PRIMARY VIP. The old PRIMARY VIP moves to GRACE state.
-2. **PRIMARY VIPs**: Should NEVER be reclaimed directly - only rotated every 60s.
-3. **GRACE VIPs**: 
-   - If idle (no active flows) when rotated → reclaim immediately
-   - If active (has active flows) when rotated → keep in GRACE until flows end, then reclaim immediately
-4. **Activity Detection**: VIP is ACTIVE if `flow_refs > 0`, IDLE if `flow_refs = 0`
-5. **Multiple VIPs per Host**: Allowed (PRIMARY + GRACE VIPs can coexist)
+from ryu.base import app_manager
+from ryu.controller import event, ofp_event
+from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
+from ryu.lib import hub
+from ryu.lib.packet import arp, ethernet, icmp, ipv4, packet, tcp, udp
+from ryu.ofproto import ofproto_v1_3
 
-### Flow Tracking
-- Each flow has a cookie based on the VIP it's associated with
-- Forward flows use `src_vip` cookie → increments `flow_refs[src_vip]`
-- Reverse flows use `dst_vip` cookie → increments `flow_refs[dst_vip]`
-- When flows expire, `flow_refs` is decremented
-- GRACE VIPs are reclaimed when `flow_refs = 0`
 
-## Current Problems
+class EventMessage(event.EventBase):
+    def __init__(self, message: str):
+        super(EventMessage, self).__init__()
+        self.msg = message
 
-### Problem 1: Rotation Happening Every 30s Instead of 60s
-**Expected**: Rotation should happen every 60 seconds (`ROTATE_INTERVAL = 60`)
-**Actual**: Rotation appears to be happening every 30 seconds
 
-**Code to Check**:
-- `_rotation_loop()` function - verify it only sleeps for `ROTATE_INTERVAL` (60s)
-- Check if there are multiple rotation loops or timers
-- Verify `ROTATE_INTERVAL = 60` constant
+class MovingTargetDefense(app_manager.RyuApp):
+    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+    _EVENTS = [EventMessage]
 
-### Problem 2: Premature Reclamation During Active Ping
-**Expected**: When actively pinging a host, both source and destination VIPs should be marked ACTIVE and not reclaimed
-**Actual**: Destination VIP is being reclaimed even during active ping
+    NUM_VIPS = 244
+    HOUSEKEEPING_INTERVAL = 15
+    ROTATE_INTERVAL = 60
+    GRACE_PERIOD = 5
+    DISCOVERY_RANGE_LAST_OCTET_MAX = 10
+    VIP_POOL_START = "10.0.0.11"
+    SESSION_IDLE_THRESHOLD = 1  # Seconds of inactivity before marking VIP as idle
 
-**Example**:
-- User pings `h1 -> h2` (10.0.0.1 -> 10.0.0.2)
-- Source VIP (10.0.0.13) is marked ACTIVE ✓
-- Destination VIP (10.0.0.14) is marked IDLE ✗
-- Destination VIP gets reclaimed even though ping is active ✗
+    FLOW_PRIORITY_VIP = 100
+    COOKIE_BASE = 0xA000_0000_0000_0000
+    COOKIE_VIP_MASK = 0xFFFF_FFFF
+    COOKIE_SESSION_MASK = 0x0000_FFFF_0000_0000
+    CONTROLLER_DISCOVERY_MAC = "02:00:00:00:00:fe"
 
-**Root Cause Suspected**:
-- Reverse flow might not be installed (check if `dst_vip_mac` is missing)
-- Reverse flow cookie might be wrong (should use `dst_vip` cookie, not `src_vip`)
-- `flow_refs[dst_vip]` is not being incremented
+    VIP_STATE_PRIMARY = "PRIMARY"
+    VIP_STATE_GRACE = "GRACE"
+    VIP_STATE_RECLAIMED = "RECLAIMED"
 
-**Code to Check**:
-- `_handle_real_to_real()` - verify reverse flow is installed with `dst_vip` cookie
-- `_handle_real_to_vip()` - verify reverse flow is installed with `dst_vip` cookie
-- Check if `dst_vip_mac` is available when installing reverse flows
-- Verify `_add_flow()` increments `flow_refs` correctly for both forward and reverse flows
+    def __init__(self, *args, **kwargs):
+        super(MovingTargetDefense, self).__init__(*args, **kwargs)
 
-### Problem 3: TCP/UDP Sessions Not Working
-**Expected**: TCP/UDP sessions (like `iperf`) should work correctly
-**Actual**: `iperf` shows "connect failed: Operation now in progress"
+        # Network topology tracking
+        self.mac_to_port: Dict[int, Dict[str, int]] = {}  # dpid -> {mac: port}
+        self.datapaths: Set["ryu.controller.controller.Datapath"] = set()  # Connected switches
+        
+        # Host discovery and mapping
+        self.detected_hosts: Set[str] = set()  # Set of discovered real host IPs (10.0.0.1-10.0.0.10)
+        self.host_ip_to_mac: Dict[str, str] = {}  # Real host IP -> MAC address
+        self.host_mac_to_ip: Dict[str, str] = {}  # MAC address -> Real host IP
+        self.host_attachments: Dict[str, int] = {}  # Real host IP -> dpid (which switch it's on)
+        
+        # VIP assignment and state
+        self.primary_vip: Dict[str, str] = {}  # Real host IP -> Primary VIP assigned to that host
+        self.vip_owner: Dict[str, str] = {}  # VIP -> Real host IP (reverse mapping of primary_vip)
+        self.vip_state: Dict[str, str] = {}  # VIP -> State (PRIMARY, GRACE, RECLAIMED)
+        self.vip_grace_until: Dict[str, float] = {}  # VIP -> Timestamp when grace period ends
+        self.vip_mac_map: Dict[str, str] = {}  # VIP -> Generated MAC address for that VIP
+        self.vip_created_at: Dict[str, float] = {}  # VIP -> Timestamp when VIP was created/assigned
+        self.host_vip_pools: Dict[str, Set[str]] = {}  # Real host IP -> Set of all VIPs assigned to that host
+        self.vip_last_seen: Dict[str, float] = {}  # VIP -> Last time VIP was seen in traffic (for activity tracking)
+        
+        # Session tracking (for active/inactive VIP determination)
+        self.vip_active_sessions: Set[str] = set()  # Set of VIPs that currently have active flows/sessions
+        self.vip_flow_count: Dict[str, int] = {}  # VIP -> count of active flows (for proper session tracking)
 
-**Root Cause Suspected**:
-- Flow matching might be missing protocol-specific fields (TCP/UDP ports)
-- Reverse flow matching might be incorrect
-- Flow installation timing (packet-out before flow install for TCP SYN)
+        # VIP resource pool
+        self.Resources: List[str] = self._generate_vips(self.VIP_POOL_START, self.NUM_VIPS)  # Available VIPs (10.0.0.11-10.0.0.254)
+        self._rotation_loop_started = False
 
-**Code to Check**:
-- `_extract_l4_match_fields()` - verify it extracts TCP/UDP ports correctly
-- `_build_ip_match()` or equivalent - verify protocol-specific matching
-- Verify `_send_packet_out()` is called BEFORE `_add_flow()` for TCP SYN packets
-- Check reverse flow matches use swapped ports correctly
+    # ---------------- lifecycle ----------------
 
-## Key Code Sections
+    def start(self):
+        super(MovingTargetDefense, self).start()
+        self.threads.append(hub.spawn(self._ticker))
+        if not self._rotation_loop_started:
+            self._rotation_loop_started = True
+            self.threads.append(hub.spawn(self._rotation_loop))
+            self.logger.info("ROTATE: started rotation loop with interval=%ss", self.ROTATE_INTERVAL)
 
-### Flow Installation
-```python
-def _add_flow(self, dp, priority, match, actions, table_id=0, idle_timeout=0, hard_timeout=0, buffer_id=None, cookie=0):
-    # Should increment flow_refs[vip] when cookie has COOKIE_BASE
-    if cookie & self.COOKIE_BASE:
+    def _ticker(self):
+        while True:
+            self.send_event_to_observers(EventMessage("TICK"))
+            hub.sleep(self.HOUSEKEEPING_INTERVAL)
+
+    @set_ev_cls(EventMessage)
+    def _housekeeping(self, ev):
+        """Periodic housekeeping tasks."""
+        now = time()
+        # Proactive host discovery
+        self._proactive_discovery(now)
+        
+        # Check for idle VIPs - only mark idle when flows actually expire
+        # CRITICAL: Once flows are installed, packets bypass controller, so vip_last_seen stops updating
+        # Flows are the source of truth - if flows exist, VIP is active (even if vip_last_seen is stale)
+        for vip in list(self.vip_active_sessions):
+            flow_count = self.vip_flow_count.get(vip, 0)
+            
+            # Only mark idle if no flows exist (flows expired naturally)
+            # Don't mark idle based on vip_last_seen - flows are being used even if controller doesn't see packets
+            if flow_count == 0:
+                self.vip_active_sessions.discard(vip)
+                self.logger.info("IDLE: VIP %s marked as idle (no active flows)", vip)
+        
+        # Reclaim VIPs in grace period that have expired (only if truly idle and no active sessions)
+        for vip in list(self.vip_grace_until.keys()):
+            # GRACE VIPs should be reclaimed immediately once they are idle.
+            flow_count = self.vip_flow_count.get(vip, 0)
+            if flow_count == 0:
+                self.logger.info("GRACE_IDLE: VIP %s is idle in GRACE, deleting flows and reclaiming", vip)
+                self._delete_flows_by_cookie(vip)
+                self.vip_flow_count.pop(vip, None)
+                self._reclaim_vip(vip)
+            else:
+                # Still active, keep it
+                self.logger.debug("KEEP GRACE: VIP %s still active (%d flows), preserving", vip, flow_count)
+        # Log VIP pools
+        self._log_vip_pools(now)
+
+    # ---------------- utils ----------------
+
+    def _generate_vips(self, start_ip: str, count: int) -> List[str]:
+        base = list(map(int, start_ip.split('.')))
+        out: List[str] = []
+        for _ in range(count):
+            out.append('.'.join(map(str, base)))
+            base[3] += 1
+            for i in (3, 2, 1):
+                if base[i] > 255:
+                    base[i] = 0
+                    base[i - 1] += 1
+        return out
+
+    def _generate_vip_mac(self, vip_ip: str) -> str:
+        o = [int(x) for x in vip_ip.split('.')]
+        return "02:%02x:%02x:%02x:%02x:%02x" % (
+            (o[0] ^ 0xAA) & 0xFF,
+            (o[1] ^ 0x55) & 0xFF,
+            o[2],
+            o[3],
+            (o[2] ^ o[3]) & 0xFF,
+        )
+
+    def _ip_to_int(self, ip: str) -> int:
+        p = ip.split('.')
+        return (int(p[0]) << 24) + (int(p[1]) << 16) + (int(p[2]) << 8) + int(p[3])
+
+    def _vip_cookie(self, vip: str) -> int:
+        return self.COOKIE_BASE | (self._ip_to_int(vip) & self.COOKIE_VIP_MASK)
+
+    def _cookie_vip_ip(self, cookie: int) -> str:
+        vip_int = cookie & self.COOKIE_VIP_MASK
+        return ".".join([
+            str((vip_int >> 24) & 0xFF),
+            str((vip_int >> 16) & 0xFF),
+            str((vip_int >> 8) & 0xFF),
+            str(vip_int & 0xFF),
+        ])
+
+    def _session_cookie(self, vip: str, pkt, ip4, direction: str) -> int:
+        """Cookie with VIP identity + per-session entropy."""
+        signature = [direction, ip4.src, ip4.dst, str(ip4.proto)]
+        tcp_pkt = pkt.get_protocol(tcp.tcp)
+        udp_pkt = pkt.get_protocol(udp.udp)
+        icmp_pkt = pkt.get_protocol(icmp.icmp)
+        if tcp_pkt:
+            signature.extend(["tcp", str(tcp_pkt.src_port), str(tcp_pkt.dst_port)])
+        elif udp_pkt:
+            signature.extend(["udp", str(udp_pkt.src_port), str(udp_pkt.dst_port)])
+        elif icmp_pkt:
+            signature.extend(["icmp", str(icmp_pkt.type), str(icmp_pkt.code)])
+        session_hash = zlib.crc32("|".join(signature).encode()) & 0xFFFF
+        return self._vip_cookie(vip) | (session_hash << 32)
+
+    def _extract_l4_match_fields(self, pkt, reverse_l4: bool = False):
+        fields = {}
+        tcp_pkt = pkt.get_protocol(tcp.tcp)
+        udp_pkt = pkt.get_protocol(udp.udp)
+        icmp_pkt = pkt.get_protocol(icmp.icmp)
+        if tcp_pkt:
+            src_port, dst_port = tcp_pkt.src_port, tcp_pkt.dst_port
+            if reverse_l4:
+                src_port, dst_port = dst_port, src_port
+            fields.update({"ip_proto": 6, "tcp_src": src_port, "tcp_dst": dst_port})
+        elif udp_pkt:
+            src_port, dst_port = udp_pkt.src_port, udp_pkt.dst_port
+            if reverse_l4:
+                src_port, dst_port = dst_port, src_port
+            fields.update({"ip_proto": 17, "udp_src": src_port, "udp_dst": dst_port})
+        elif icmp_pkt:
+            fields.update({"ip_proto": 1, "icmpv4_type": icmp_pkt.type, "icmpv4_code": icmp_pkt.code})
+        return fields
+
+    def _build_ip_match(self, parser, pkt, src_ip: str, dst_ip: str, reverse_l4: bool = False):
+        kwargs = {"eth_type": 0x0800, "ipv4_src": src_ip, "ipv4_dst": dst_ip}
+        kwargs.update(self._extract_l4_match_fields(pkt, reverse_l4=reverse_l4))
+        return parser.OFPMatch(**kwargs)
+
+    def _delete_flows_by_cookie(self, vip: str):
+        """Delete all flows for a VIP by matching cookie."""
+        cookie = self._vip_cookie(vip)
+        cookie_mask = 0xFFFFFFFF  # Match lower 32 bits (VIP IP)
+        
+        for dp in list(self.datapaths):
+            try:
+                parser = dp.ofproto_parser
+                ofp = dp.ofproto
+                # Delete flows matching this cookie
+                mod = parser.OFPFlowMod(
+                    datapath=dp,
+                    table_id=ofp.OFPTT_ALL,
+                    command=ofp.OFPFC_DELETE,
+                    out_port=ofp.OFPP_ANY,
+                    out_group=ofp.OFPG_ANY,
+                    cookie=cookie,
+                    cookie_mask=cookie_mask,
+                )
+                dp.send_msg(mod)
+                self.logger.info("FLOW_DELETE: Deleted flows for VIP %s (cookie=0x%x)", vip, cookie)
+            except Exception as e:
+                self.logger.warning("FLOW_DELETE: Failed to delete flows for VIP %s: %s", vip, e)
+
+    def _add_flow(self, dp, priority, match, actions, table_id=0, idle_timeout=0, hard_timeout=0, buffer_id=None, cookie=0):
+        """Install a flow rule on the switch."""
+        parser = dp.ofproto_parser
+        ofp = dp.ofproto
+        if buffer_id is None:
+            buffer_id = ofp.OFP_NO_BUFFER
+        inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+        mod = parser.OFPFlowMod(
+            datapath=dp,
+            table_id=table_id,
+            priority=priority,
+            match=match,
+            instructions=inst,
+            cookie=cookie,
+            flags=ofp.OFPFF_SEND_FLOW_REM,
+            idle_timeout=idle_timeout,
+            hard_timeout=hard_timeout,
+            buffer_id=buffer_id,
+        )
+        dp.send_msg(mod)
+        if cookie & self.COOKIE_BASE:
+            self._track_flow_cookie(cookie)
+
+    def _track_flow_cookie(self, cookie: int):
+        """Track active flow counters using the VIP encoded in cookie."""
         vip = self._cookie_vip_ip(cookie)
-        self.vip_flow_refs[vip] = self.vip_flow_refs.get(vip, 0) + 1
-```
+        if vip in self.vip_owner:
+            self.vip_active_sessions.add(vip)
+            self.vip_flow_count[vip] = self.vip_flow_count.get(vip, 0) + 1
 
-### Reverse Flow Installation (CRITICAL)
-```python
-# In _handle_real_to_real() and _handle_real_to_vip():
-# Reverse flow MUST use dst_vip cookie to track destination VIP activity
-cookie_rev = self._vip_cookie(dst_vip)  # NOT src_vip!
-self._add_flow(..., cookie=cookie_rev, ...)
-```
+    def _take_resource_vip(self) -> Optional[str]:
+        """Take a VIP from the resource pool."""
+        if self.Resources:
+            return self.Resources.pop(0)
+        return None
 
-### Rotation Logic
-```python
-def _rotation_loop(self):
-    while True:
-        hub.sleep(self.ROTATE_INTERVAL)  # Should be 60s
-        # Rotate PRIMARY VIPs
-        # Move old VIP to GRACE
-        # Check flow_refs to determine if idle or active
-```
+    def _bind_primary_vip(self, host_ip: str, vip: str, now: float):
+        """Bind a VIP as the primary VIP for a host."""
+        self.primary_vip[host_ip] = vip
+        self.vip_owner[vip] = host_ip
+        self.vip_state[vip] = self.VIP_STATE_PRIMARY
+        self.vip_mac_map[vip] = self._generate_vip_mac(vip)
+        self.vip_created_at[vip] = now
+        self.host_vip_pools.setdefault(host_ip, set()).add(vip)
+        self.logger.info("BIND: host=%s vip=%s", host_ip, vip)
 
-## What Needs to Be Fixed
+    # ---------------- switch bringup ----------------
 
-1. **Verify rotation interval**: Ensure rotation happens exactly every 60s, not 30s
-2. **Fix reverse flow installation**: Ensure reverse flows are ALWAYS installed with `dst_vip` cookie when traffic is bidirectional
-3. **Fix flow_refs tracking**: Both forward and reverse flows must increment `flow_refs` for their respective VIPs
-4. **Fix TCP/UDP matching**: Ensure protocol-specific fields (ports) are included in flow matches
-5. **Fix flow installation order**: Send packet-out BEFORE installing flow for TCP SYN packets
-6. **Add comprehensive logging**: Log when reverse flows fail to install and why
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
+    def switch_features_handler(self, ev):
+        dp = ev.msg.datapath
+        self.datapaths.add(dp)
+        parser = dp.ofproto_parser
+        ofp = dp.ofproto
+        match = parser.OFPMatch()
+        actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
+        self._add_flow(dp, priority=0, match=match, actions=actions, table_id=0, idle_timeout=0)
+        self.logger.info("[SW] Switch %016x connected; installed table-miss", dp.id)
+
+    # ---------------- rotation ----------------
+
+    def _rotation_loop(self):
+        while True:
+            hub.sleep(self.ROTATE_INTERVAL)
+            self.logger.debug("ROTATE: wakeup after %ss", self.ROTATE_INTERVAL)
+            now = time()
+            for host_ip in sorted(self.detected_hosts):
+                old_vip = self.primary_vip.get(host_ip)
+                new_vip = self._take_resource_vip()
+                if not new_vip:
+                    self.logger.warning("ROTATE: no VIP available for %s", host_ip)
+                    continue
+                self._bind_primary_vip(host_ip, new_vip, now)
+                if old_vip and old_vip != new_vip:
+                    self.vip_state[old_vip] = self.VIP_STATE_GRACE
+                    self.vip_grace_until[old_vip] = now
+                    old_refs = self.vip_flow_count.get(old_vip, 0)
+                    if old_refs == 0:
+                        self.logger.info("ROTATE: host=%s new=%s old=%s -> GRACE/IDLE reclaim now",
+                                         host_ip, new_vip, old_vip)
+                        self._reclaim_vip(old_vip)
+                    else:
+                        self.logger.info("ROTATE: host=%s new=%s old=%s -> GRACE/ACTIVE refs=%d",
+                                         host_ip, new_vip, old_vip, old_refs)
+
+    # ---------------- host discovery ----------------
+
+    def _learn_host(self, pkt, dpid: int):
+        """Learn host from ARP or IP packet."""
+        eth_pkt = pkt.get_protocol(ethernet.ethernet)
+        arp_pkt = pkt.get_protocol(arp.arp)
+        ip_pkt = pkt.get_protocol(ipv4.ipv4)
+
+        real_ip, mac = None, None
+        if arp_pkt:
+            real_ip, mac = arp_pkt.src_ip, arp_pkt.src_mac
+        elif ip_pkt and eth_pkt:
+            real_ip, mac = ip_pkt.src, eth_pkt.src
+        else:
+            return
+
+        if not real_ip:
+            return
+
+        # Only learn hosts in discovery range
+        try:
+            if not real_ip.startswith("10.0.0."):
+                return
+            last = int(real_ip.split(".")[-1])
+            if last < 1 or last > self.DISCOVERY_RANGE_LAST_OCTET_MAX:
+                return
+        except Exception:
+            return
+
+        # Update host info
+        if mac:
+            self.host_ip_to_mac[real_ip] = mac
+            self.host_mac_to_ip[mac] = real_ip
+        self.host_attachments[real_ip] = dpid
+
+        # New host discovered
+        if real_ip not in self.detected_hosts:
+            self.detected_hosts.add(real_ip)
+            self.host_vip_pools.setdefault(real_ip, set())
+            # Assign initial primary VIP
+            now = time()
+            new_vip = self._take_resource_vip()
+            if new_vip:
+                self._bind_primary_vip(real_ip, new_vip, now)
+                self.logger.info("[+] New host %s (%s) - assigned VIP: %s",
+                                real_ip, mac, new_vip)
+
+    def _send_arp_reply(self, dp, dst_mac, src_mac, src_ip, target_ip, out_port):
+        """Send ARP reply."""
+        parser = dp.ofproto_parser
+        ofp = dp.ofproto
+        p = packet.Packet()
+        p.add_protocol(ethernet.ethernet(
+            ethertype=0x0806,
+            dst=dst_mac,
+            src=src_mac
+        ))
+        p.add_protocol(arp.arp(
+            opcode=arp.ARP_REPLY,
+            src_mac=src_mac,
+            src_ip=src_ip,
+            dst_mac=dst_mac,
+            dst_ip=target_ip
+        ))
+        p.serialize()
+        dp.send_msg(parser.OFPPacketOut(
+            datapath=dp,
+            buffer_id=ofp.OFP_NO_BUFFER,
+            in_port=ofp.OFPP_CONTROLLER,
+            actions=[parser.OFPActionOutput(out_port)],
+            data=p.data
+        ))
+
+    def _send_arp_request(self, dp, target_ip: str):
+        """Send ARP request for a real host to accelerate MAC learning."""
+        parser = dp.ofproto_parser
+        ofp = dp.ofproto
+        p = packet.Packet()
+        p.add_protocol(ethernet.ethernet(
+            ethertype=0x0806,
+            dst='ff:ff:ff:ff:ff:ff',
+            src=self.CONTROLLER_DISCOVERY_MAC
+        ))
+        p.add_protocol(arp.arp(
+            opcode=arp.ARP_REQUEST,
+            src_mac=self.CONTROLLER_DISCOVERY_MAC,
+            src_ip='10.0.0.254',
+            dst_mac='00:00:00:00:00:00',
+            dst_ip=target_ip
+        ))
+        p.serialize()
+        dp.send_msg(parser.OFPPacketOut(
+            datapath=dp,
+            buffer_id=ofp.OFP_NO_BUFFER,
+            in_port=ofp.OFPP_CONTROLLER,
+            actions=[parser.OFPActionOutput(ofp.OFPP_FLOOD)],
+            data=p.data
+        ))
+
+    def _proactive_discovery(self, now: float):
+        """Proactively send ARP requests to discover hosts."""
+        if not self.datapaths:
+            return
+
+        # Track last discovery time per IP
+        if not hasattr(self, '_last_discovery'):
+            self._last_discovery = {}
+
+        # Send ARP requests for hosts in discovery range
+        for last_octet in range(1, self.DISCOVERY_RANGE_LAST_OCTET_MAX + 1):
+            target_ip = f"10.0.0.{last_octet}"
+
+            # Skip if already discovered
+            if target_ip in self.detected_hosts:
+                continue
+
+            # Rate limit: don't send more than once per 60 seconds
+            if target_ip in self._last_discovery:
+                if now - self._last_discovery[target_ip] < 60:
+                    continue
+
+            self._last_discovery[target_ip] = now
+
+            # Send ARP request on all datapaths
+            for dp in list(self.datapaths):
+                try:
+                    parser = dp.ofproto_parser
+                    ofp = dp.ofproto
+                    p = packet.Packet()
+                    p.add_protocol(ethernet.ethernet(
+                        ethertype=0x0806,
+                        dst='ff:ff:ff:ff:ff:ff',
+                        src=self.CONTROLLER_DISCOVERY_MAC
+                    ))
+                    p.add_protocol(arp.arp(
+                        opcode=arp.ARP_REQUEST,
+                        src_mac=self.CONTROLLER_DISCOVERY_MAC,
+                        src_ip='10.0.0.254',  # Controller IP
+                        dst_mac='00:00:00:00:00:00',
+                        dst_ip=target_ip
+                    ))
+                    p.serialize()
+                    dp.send_msg(parser.OFPPacketOut(
+                        datapath=dp,
+                        buffer_id=ofp.OFP_NO_BUFFER,
+                        in_port=ofp.OFPP_CONTROLLER,
+                        actions=[parser.OFPActionOutput(ofp.OFPP_FLOOD)],
+                        data=p.data
+                    ))
+                except Exception as e:
+                    self.logger.debug("Discovery ARP to %s failed: %s", target_ip, e)
+
+    # ---------------- logging ----------------
+
+    def _log_vip_pools(self, now: float):
+        """Log VIP pools per host."""
+        self.logger.info("=== VIP POOLS ===")
+        
+        def ipkey(ip):
+            try:
+                return tuple(int(x) for x in ip.split('.'))
+            except Exception:
+                return (ip,)
+
+        total = 0
+        active_total = 0
+        for real_ip in sorted(self.detected_hosts, key=ipkey):
+            pool = self.host_vip_pools.get(real_ip, set())
+            if not pool:
+                self.logger.info("Host %s: No VIPs assigned", real_ip)
+                continue
+
+            self.logger.info("Host %s (%d VIPs):", real_ip, len(pool))
+            self.logger.info(" %-13s %-9s %-15s", "VIP", "Uptime", "State")
+            self.logger.info(" %-13s %-9s %-15s", "-------------", "---------", "---------------")
+
+            host_active = 0
+            for vip in sorted(pool, key=ipkey):
+                created = self.vip_created_at.get(vip, now)
+                uptime = f"{max(0.0, (now - created)):.1f}s"
+                state = self.vip_state.get(vip, "UNKNOWN")
+                # Mark as ACTIVE only if it has active sessions, not just because it's PRIMARY
+                is_active = vip in self.vip_active_sessions
+                if is_active:
+                    host_active += 1
+                    active_total += 1
+                    state_display = f"{state}/ACTIVE"
+                else:
+                    state_display = f"{state}/IDLE"
+                self.logger.info(" %-13s %-9s %-15s", vip, uptime, state_display)
+            total += len(pool)
+            self.logger.info(" → %d active, %d idle", host_active, len(pool) - host_active)
+
+        self.logger.info("=== SUMMARY: %d total VIPs (%d active, %d idle) ===",
+                         total, active_total, total - active_total)
+
+    # ---------------- flow removal tracking ----------------
+
+    @set_ev_cls(ofp_event.EventOFPFlowRemoved, MAIN_DISPATCHER)
+    def _flow_removed_handler(self, ev):
+        """Track flow removals to update active session tracking."""
+        msg = ev.msg
+        cookie = msg.cookie
+        
+        # Check if this cookie corresponds to a VIP (has COOKIE_BASE prefix)
+        if (cookie & 0xFFFF000000000000) != self.COOKIE_BASE:
+            return
+
+        # Resolve VIP from cookie lower bits (VIP identity), session bits are ignored.
+        vip = self._cookie_vip_ip(cookie)
+
+        if vip not in self.vip_owner:
+            return
+
+        # Decrement flow count for this VIP (never negative).
+        current_count = self.vip_flow_count.get(vip, 0)
+        if current_count <= 0:
+            self.vip_flow_count.pop(vip, None)
+            self.vip_active_sessions.discard(vip)
+            return
+
+        remaining = current_count - 1
+        if remaining > 0:
+            self.vip_flow_count[vip] = remaining
+        else:
+            self.vip_flow_count.pop(vip, None)
+            self.vip_active_sessions.discard(vip)
+
+        self.logger.debug("FLOW_REMOVED: VIP %s flow expired (cookie=0x%x), remaining flows=%d",
+                          vip, cookie, max(0, remaining))
+
+        # Only remove from active_sessions when ALL flows for this VIP expire
+        if remaining == 0:
+            self.logger.info("FLOW_REMOVED: VIP %s all flows expired, marking as inactive", vip)
+
+            # Check if VIP should be reclaimed (past grace period and no active sessions)
+            now = time()
+            if vip in self.vip_grace_until:
+                grace_until = self.vip_grace_until[vip]
+                if now >= grace_until:
+                    last_seen = self.vip_last_seen.get(vip, grace_until - self.GRACE_PERIOD)
+                    idle_time = now - last_seen
+                    if idle_time > self.GRACE_PERIOD:
+                        self.logger.info("FLOW_REMOVED: Reclaiming VIP %s (grace expired %.1fs ago, no active sessions)",
+                                         vip, idle_time)
+                        self._reclaim_vip(vip)
+                    else:
+                        self.logger.debug("FLOW_REMOVED: VIP %s still in grace (idle %.1fs < %.1fs)",
+                                          vip, idle_time, self.GRACE_PERIOD)
+
+    # ---------------- VIP reclamation ----------------
+
+    def _reclaim_vip(self, vip: str):
+        """Reclaim a VIP and return it to the resource pool."""
+        owner = self.vip_owner.pop(vip, None)
+        if not owner:
+            return
+
+        # Remove from host pool
+        if owner in self.host_vip_pools:
+            self.host_vip_pools[owner].discard(vip)
+
+        # Clear state
+        self.vip_state.pop(vip, None)
+        self.vip_grace_until.pop(vip, None)
+        self.vip_mac_map.pop(vip, None)
+        self.vip_created_at.pop(vip, None)
+        self.vip_last_seen.pop(vip, None)  # Clear activity tracking
+        self.vip_active_sessions.discard(vip)  # Remove from active sessions
+        self.vip_flow_count.pop(vip, None)  # Clear flow count
+
+        # If it was primary, clear it
+        if self.primary_vip.get(owner) == vip:
+            self.primary_vip.pop(owner, None)
+
+        # Return to resource pool
+        if vip not in self.Resources:
+            self.Resources.append(vip)
+
+        self.logger.info("RECLAIM: VIP %s from host %s", vip, owner)
+
+    # ---------------- packet handling ----------------
+
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    def _packet_in(self, ev):
+        msg = ev.msg
+        dp = msg.datapath
+        parser = dp.ofproto_parser
+        ofp = dp.ofproto
+        in_port = msg.match['in_port']
+        dpid = dp.id
+
+        pkt = packet.Packet(msg.data)
+        eth = pkt.get_protocol(ethernet.ethernet)
+        if not eth:
+            return
+
+        self.mac_to_port.setdefault(dpid, {})
+        self.mac_to_port[dpid][eth.src] = in_port
+        
+        # Enhanced MAC learning from ARP replies (CRITICAL for efficiency)
+        arp_pkt = pkt.get_protocol(arp.arp)
+        if arp_pkt and arp_pkt.opcode == arp.ARP_REPLY:
+            # ARP reply source = the host that replied (this is what we want to learn)
+            reply_src_mac = arp_pkt.src_mac  # MAC of host that sent the reply
+            reply_src_ip = arp_pkt.src_ip    # IP of host that sent the reply
+            
+            # Learn the MAC and port of the replying host
+            if reply_src_ip in self.detected_hosts:
+                self.mac_to_port[dpid][reply_src_mac] = in_port
+                # Ensure host_ip_to_mac is updated (critical for flow installation)
+                if reply_src_ip not in self.host_ip_to_mac:
+                    self.host_ip_to_mac[reply_src_ip] = reply_src_mac
+                    self.host_mac_to_ip[reply_src_mac] = reply_src_ip
+                self.logger.debug("MAC_LEARN: Learned %s (host %s) -> port %d from ARP reply", 
+                                 reply_src_mac, reply_src_ip, in_port)
+
+        # Handle ARP
+        arp_pkt = pkt.get_protocol(arp.arp)
+        if arp_pkt:
+            self._learn_host(pkt, dpid)
+            self._handle_arp(msg, dp, pkt, arp_pkt, eth, in_port, dpid)
+            return
+
+        # Handle IP packets
+        ip4 = pkt.get_protocol(ipv4.ipv4)
+        if not ip4:
+            return
+
+        self._learn_host(pkt, dpid)
+        src_ip, dst_ip = ip4.src, ip4.dst
+
+        # Detect protocol for logging
+        tcp_pkt = pkt.get_protocol(tcp.tcp)
+        udp_pkt = pkt.get_protocol(udp.udp)
+        icmp_pkt = pkt.get_protocol(icmp.icmp)
+        proto_name = "TCP" if tcp_pkt else ("UDP" if udp_pkt else ("ICMP" if icmp_pkt else "IP"))
+        
+        # Update VIP activity tracking for all IP packets (CRITICAL: prevents premature reclaim during active sessions)
+        now_pkt = time()
+        if dst_ip in self.vip_owner:
+            self.vip_last_seen[dst_ip] = now_pkt
+            self.logger.debug("[%s] Updated vip_last_seen[%s] (packet to VIP)", proto_name, dst_ip)
+        if src_ip in self.vip_owner:
+            self.vip_last_seen[src_ip] = now_pkt
+            self.logger.debug("[%s] Updated vip_last_seen[%s] (packet from VIP)", proto_name, src_ip)
+
+        # Determine if src/dst are real IPs or VIPs
+        src_is_real = src_ip in self.detected_hosts
+        dst_is_real = dst_ip in self.detected_hosts
+        src_is_vip = src_ip in self.vip_owner
+        dst_is_vip = dst_ip in self.vip_owner
+
+        # Real-to-real communication: use VIPs (SNAT + DNAT)
+        if src_is_real and dst_is_real:
+            self._handle_real_to_real(msg, dp, pkt, ip4, eth, in_port, dpid, src_ip, dst_ip)
+            return
+
+        # Real-to-VIP: SNAT only (source is real, destination is already VIP)
+        if src_is_real and dst_is_vip:
+            self._handle_real_to_vip(msg, dp, pkt, ip4, eth, in_port, dpid, src_ip, dst_ip)
+            return
+
+        # VIP-to-real: DNAT only (destination is real, source is VIP)
+        if src_is_vip and dst_is_real:
+            self._handle_vip_to_real(msg, dp, pkt, ip4, eth, in_port, dpid, src_ip, dst_ip)
+            return
+
+        # VIP-to-VIP: already translated, just forward
+        if src_is_vip and dst_is_vip:
+            self._handle_vip_to_vip(msg, dp, pkt, ip4, eth, in_port, dpid, src_ip, dst_ip)
+            return
+
+        # Unknown: forward as-is
+        self._forward_packet(msg, dp, in_port, dpid, eth.dst, ofp.OFPP_FLOOD)
+
+    def _handle_arp(self, msg, dp, pkt, arp_pkt, eth, in_port, dpid):
+        """Handle ARP packets."""
+        parser = dp.ofproto_parser
+        ofp = dp.ofproto
+
+        if arp_pkt.opcode == arp.ARP_REQUEST:
+            target_ip = arp_pkt.dst_ip
+
+            # Check if request is for a VIP
+            if target_ip in self.vip_owner:
+                # Reply with VIP's MAC
+                vip_mac = self.vip_mac_map.get(target_ip)
+                if vip_mac:
+                    self._send_arp_reply(
+                        dp, eth.src, vip_mac, target_ip, arp_pkt.src_ip, in_port
+                    )
+                    self.logger.debug("ARP: replied VIP %s -> %s", target_ip, vip_mac)
+                return
+
+            # Check if request is for a real host (reply with VIP MAC)
+            if target_ip in self.detected_hosts:
+                primary_vip = self.primary_vip.get(target_ip)
+                if primary_vip:
+                    vip_mac = self.vip_mac_map.get(primary_vip)
+                    if vip_mac:
+                        self._send_arp_reply(
+                            # For ARP requests to a real IP, keep SPA as the requested real IP
+                            # so the requester resolves dst_real in its ARP cache, while exposing
+                            # only the virtual VIP MAC at L2.
+                            dp, eth.src, vip_mac, target_ip, arp_pkt.src_ip, in_port
+                        )
+                        self.logger.debug("ARP: replied real %s with VIP MAC %s", target_ip, vip_mac)
+                        # CRITICAL: When we reply to ARP, we should also ensure the target host's
+                        # real MAC is learned (if not already). This happens when the target host
+                        # sends packets, but we can't rely on that timing.
+                        # The real MAC will be learned when the target host sends its own packets.
+                return
+
+            # Unknown destination host: do not drop ARP discovery traffic.
+            # Flood request so target can answer and be learned dynamically.
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, ofp.OFPP_FLOOD)
+            return
+
+        # Forward ARP replies/other ARP frames so hosts can complete neighbor resolution.
+        out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+        self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
+
+    def _handle_real_to_real(self, msg, dp, pkt, ip4, eth, in_port, dpid, src_real, dst_real):
+        """Handle traffic between two real hosts: translate both to VIPs."""
+        parser = dp.ofproto_parser
+        ofp = dp.ofproto
+
+        src_vip = self.primary_vip.get(src_real)
+        dst_vip = self.primary_vip.get(dst_real)
+
+        if not src_vip or not dst_vip:
+            self.logger.warning("REAL-TO-REAL: Missing VIP for src=%s or dst=%s", src_real, dst_real)
+            out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
+            return
+
+        now_pkt = time()
+        self.vip_last_seen[src_vip] = now_pkt
+        self.vip_last_seen[dst_vip] = now_pkt
+
+        src_vip_mac = self.vip_mac_map.get(src_vip)
+        dst_real_mac = self.host_ip_to_mac.get(dst_real)
+
+        if not src_vip_mac:
+            self.logger.warning("REAL-TO-REAL: Missing VIP MAC for src_vip=%s", src_vip)
+            out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
+            return
+        
+        # CRITICAL: If destination MAC not learned yet, the host hasn't sent packets yet
+        # This is a timing issue - proactive discovery should have learned it, but if not,
+        # we need to wait for the host to send a packet. For now, forward the packet as-is
+        # and it will trigger the host to send a reply, which will allow us to learn its MAC
+        if not dst_real_mac:
+            self.logger.warning("REAL-TO-REAL: Destination MAC unknown for %s, sending ARP probe and using broadcast fallback", dst_real)
+            self._send_arp_request(dp, dst_real)
+            # Fallback: send translated packet with broadcast L2 dst so the real host can still
+            # receive it while MAC learning converges.
+            actions = [
+                parser.OFPActionSetField(ipv4_src=src_vip),
+                parser.OFPActionSetField(ipv4_dst=dst_real),
+                parser.OFPActionSetField(eth_src=src_vip_mac),
+                parser.OFPActionSetField(eth_dst='ff:ff:ff:ff:ff:ff'),
+                parser.OFPActionOutput(ofp.OFPP_FLOOD),
+            ]
+            self._send_packet_out(msg, dp, in_port, actions)
+            return
+
+        # Install forward flow: src_real -> dst_real becomes src_vip -> dst_vip
+        # This ensures VIPs communicate on the wire, not real IPs
+        match = self._build_ip_match(parser, pkt, src_real, dst_real)
+        dst_vip_mac = self.vip_mac_map.get(dst_vip)
+        if not dst_vip_mac:
+            self.logger.warning("REAL-TO-REAL: Missing VIP MAC for dst_vip=%s", dst_vip)
+            out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
+            return
+        
+        # Determine output port for destination
+        # CRITICAL: Only use specific port if we've learned it from a packet FROM that MAC
+        # Otherwise, use FLOOD to ensure packet delivery
+        dst_port = self.mac_to_port.get(dpid, {}).get(dst_real_mac, None)
+        if dst_port is None:
+            # Destination MAC not learned yet - always use FLOOD
+            # This ensures packets are delivered even if MAC learning hasn't happened yet
+            dst_port = ofp.OFPP_FLOOD
+            self.logger.debug("REAL-TO-REAL: Destination MAC %s not learned, using FLOOD for %s -> %s",
+                             dst_real_mac, src_real, dst_real)
+        
+        actions = [
+            parser.OFPActionSetField(ipv4_src=src_vip),  # SNAT: real -> VIP (source uses VIP)
+            parser.OFPActionSetField(ipv4_dst=dst_real),  # Keep destination as real IP (h2 needs to accept it)
+            parser.OFPActionSetField(eth_src=src_vip_mac),  # Source MAC is VIP MAC
+            parser.OFPActionSetField(eth_dst=dst_real_mac),  # Destination MAC is real host MAC
+            parser.OFPActionOutput(dst_port)
+        ]
+        # CRITICAL: Update vip_last_seen for BOTH VIPs before sending packet
+        # This ensures both source and destination VIPs are tracked as active
+        now_pkt = time()
+        self.vip_last_seen[src_vip] = now_pkt
+        self.vip_last_seen[dst_vip] = now_pkt
+        self.logger.debug("REAL-TO-REAL: Updated vip_last_seen for src_vip=%s and dst_vip=%s", src_vip, dst_vip)
+        
+        # CRITICAL: Send packet out FIRST, then install flow for future packets
+        # This ensures TCP SYN and other first packets are sent immediately
+        self._send_packet_out(msg, dp, in_port, actions)
+        # Now install flow for subsequent packets
+        cookie_fwd = self._session_cookie(src_vip, pkt, ip4, "fwd")
+        self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
+                      cookie=self._session_cookie(src_vip, pkt, ip4, "fwd"), idle_timeout=60)
+        # Mark both VIPs as having active session and increment flow count
+        self.vip_active_sessions.add(src_vip)
+        self.vip_active_sessions.add(dst_vip)
+        self.vip_flow_count[src_vip] = self.vip_flow_count.get(src_vip, 0) + 1
+        self.vip_flow_count[dst_vip] = self.vip_flow_count.get(dst_vip, 0) + 1
+
+        # Install reverse flow: dst_real -> src_real becomes dst_vip -> src_real
+        # When h2 replies, it sends from dst_real to src_real, translate source to VIP
+        src_real_mac = self.host_ip_to_mac.get(src_real)
+        if src_real_mac:
+            # Flow 1: Match h2's reply (real2 -> real1), translate source to VIP2
+            match_rev = self._build_ip_match(parser, pkt, dst_real, src_real, reverse_l4=True)
+            # Determine output port for source (reverse direction)
+            # CRITICAL: Only use specific port if we've learned it from a packet FROM that MAC
+            # Otherwise, use FLOOD to ensure packet delivery
+            src_port = self.mac_to_port.get(dpid, {}).get(src_real_mac, None)
+            if src_port is None:
+                # Source MAC not learned yet - always use FLOOD
+                src_port = ofp.OFPP_FLOOD
+                self.logger.debug("REAL-TO-REAL: Source MAC %s not learned for reverse flow, using FLOOD for %s -> %s",
+                                 src_real_mac, dst_real, src_real)
+            
+            actions_rev = [
+                parser.OFPActionSetField(ipv4_src=dst_real),  # Keep source as real IP for host TCP/UDP compatibility
+                parser.OFPActionSetField(ipv4_dst=src_real),  # Keep destination as real IP (h1 needs to accept it)
+                parser.OFPActionSetField(eth_src=dst_vip_mac),  # Source MAC is VIP MAC
+                parser.OFPActionSetField(eth_dst=src_real_mac),  # Destination MAC is real host MAC
+                parser.OFPActionOutput(src_port)
+            ]
+            cookie_rev = self._session_cookie(dst_vip, pkt, ip4, "rev")
+            self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
+                          cookie=cookie_rev, idle_timeout=60)
+            # Mark both VIPs as having active session and increment flow count
+            self.vip_active_sessions.add(src_vip)
+            self.vip_active_sessions.add(dst_vip)
+            self.vip_flow_count[src_vip] = self.vip_flow_count.get(src_vip, 0) + 1
+            self.vip_flow_count[dst_vip] = self.vip_flow_count.get(dst_vip, 0) + 1
+            
+            # Flow 2: Also handle case where h2 might reply to VIP1 directly (if it saw VIP1 as source)
+            # Match VIP2 -> VIP1 (on wire), translate to VIP2 -> real1 for delivery
+            match_vip_reply = self._build_ip_match(parser, pkt, dst_vip, src_vip, reverse_l4=True)
+            actions_vip_reply = [
+                parser.OFPActionSetField(ipv4_src=dst_real),  # Restore source to real IP for host compatibility
+                parser.OFPActionSetField(ipv4_dst=src_real),  # Translate destination to real for h1 to accept
+                parser.OFPActionSetField(eth_src=dst_vip_mac),
+                parser.OFPActionSetField(eth_dst=src_real_mac),
+                parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD))
+            ]
+            cookie_vip_reply = self._session_cookie(dst_vip, pkt, ip4, "rev")
+            self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_vip_reply, actions=actions_vip_reply,
+                          cookie=cookie_vip_reply, idle_timeout=60)
+            self.vip_active_sessions.add(src_vip)
+            self.vip_active_sessions.add(dst_vip)
+            self.vip_flow_count[src_vip] = self.vip_flow_count.get(src_vip, 0) + 1
+            self.vip_flow_count[dst_vip] = self.vip_flow_count.get(dst_vip, 0) + 1
+
+        self.logger.debug("REAL-TO-REAL: %s -> %s (translated to %s -> %s, source VIP active)",
+                         src_real, dst_real, src_vip, dst_real)
+
+    def _handle_real_to_vip(self, msg, dp, pkt, ip4, eth, in_port, dpid, src_real, dst_vip):
+        """Handle traffic from real host to VIP: SNAT only."""
+        parser = dp.ofproto_parser
+        ofp = dp.ofproto
+
+        src_vip = self.primary_vip.get(src_real)
+        if not src_vip:
+            out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
+            return
+
+        real_dst = self.vip_owner.get(dst_vip)
+        if not real_dst:
+            out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
+            return
+
+        now_pkt = time()
+        self.vip_last_seen[src_vip] = now_pkt
+        self.vip_last_seen[dst_vip] = now_pkt
+
+        src_vip_mac = self.vip_mac_map.get(src_vip)
+        dst_real_mac = self.host_ip_to_mac.get(real_dst)
+        dst_vip_mac = self.vip_mac_map.get(dst_vip)
+
+        if not src_vip_mac or not dst_real_mac or not dst_vip_mac:
+            out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
+            return
+
+        # Install flow: src_real -> dst_vip becomes src_vip -> real_dst
+        match = self._build_ip_match(parser, pkt, src_real, dst_vip)
+        actions = [
+            parser.OFPActionSetField(ipv4_src=src_vip),
+            parser.OFPActionSetField(ipv4_dst=real_dst),
+            parser.OFPActionSetField(eth_src=src_vip_mac),
+            parser.OFPActionSetField(eth_dst=dst_real_mac),
+            parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(dst_real_mac, ofp.OFPP_FLOOD))
+        ]
+        # CRITICAL: Update vip_last_seen for BOTH VIPs before sending packet
+        now_pkt = time()
+        self.vip_last_seen[src_vip] = now_pkt
+        self.vip_last_seen[dst_vip] = now_pkt
+        
+        # CRITICAL: Send packet out FIRST for TCP SYN and other first packets
+        self._send_packet_out(msg, dp, in_port, actions)
+        # Now install flow for subsequent packets
+        cookie_fwd = self._session_cookie(src_vip, pkt, ip4, "fwd")
+        self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
+                      cookie=cookie_fwd, idle_timeout=60)
+        self.vip_active_sessions.add(src_vip)
+        self.vip_active_sessions.add(dst_vip)
+        self.vip_flow_count[src_vip] = self.vip_flow_count.get(src_vip, 0) + 1
+        self.vip_flow_count[dst_vip] = self.vip_flow_count.get(dst_vip, 0) + 1
+
+        # Install reverse flow: real_dst -> src_vip becomes dst_vip -> src_real
+        src_real_mac = self.host_ip_to_mac.get(src_real)
+        if src_real_mac:
+            match_rev = self._build_ip_match(parser, pkt, real_dst, src_vip, reverse_l4=True)
+            actions_rev = [
+                parser.OFPActionSetField(ipv4_src=real_dst),  # Keep source as real IP for host TCP/UDP compatibility
+                parser.OFPActionSetField(ipv4_dst=src_real),  # Reverse DNAT: VIP -> real
+                parser.OFPActionSetField(eth_src=dst_vip_mac),
+                parser.OFPActionSetField(eth_dst=src_real_mac),
+                parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD))
+            ]
+            cookie_rev = self._session_cookie(dst_vip, pkt, ip4, "rev")
+            self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
+                          cookie=cookie_rev, idle_timeout=60)
+            self.vip_active_sessions.add(src_vip)
+            self.vip_active_sessions.add(dst_vip)
+            self.vip_flow_count[src_vip] = self.vip_flow_count.get(src_vip, 0) + 1
+            self.vip_flow_count[dst_vip] = self.vip_flow_count.get(dst_vip, 0) + 1
+
+    def _handle_vip_to_real(self, msg, dp, pkt, ip4, eth, in_port, dpid, src_vip, dst_real):
+        """Handle traffic from VIP to real host: reverse SNAT (translate source VIP to real IP)."""
+        parser = dp.ofproto_parser
+        ofp = dp.ofproto
+
+        real_src = self.vip_owner.get(src_vip)
+        if not real_src:
+            out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
+            return
+
+        now_pkt = time()
+        self.vip_last_seen[src_vip] = now_pkt
+        dst_vip = self.primary_vip.get(dst_real)
+        if dst_vip:
+            self.vip_last_seen[dst_vip] = now_pkt
+
+        dst_real_mac = self.host_ip_to_mac.get(dst_real)
+        if not dst_real_mac:
+            out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
+            return
+
+        # Install flow: src_vip -> dst_real becomes real_src -> dst_real
+        match = self._build_ip_match(parser, pkt, src_vip, dst_real)
+        actions = [
+            parser.OFPActionSetField(ipv4_src=real_src),  # Reverse SNAT: VIP -> real
+            parser.OFPActionSetField(eth_dst=dst_real_mac),
+            parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(dst_real_mac, ofp.OFPP_FLOOD))
+        ]
+        # CRITICAL: Update vip_last_seen for source VIP before sending packet
+        now_pkt = time()
+        self.vip_last_seen[src_vip] = now_pkt
+        
+        # CRITICAL: Send packet out FIRST for TCP SYN and other first packets
+        self._send_packet_out(msg, dp, in_port, actions)
+        # Now install flow for subsequent packets
+        cookie_fwd = self._session_cookie(src_vip, pkt, ip4, "fwd")
+        self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
+                      cookie=cookie_fwd, idle_timeout=60)
+        self.vip_active_sessions.add(src_vip)
+        self.vip_flow_count[src_vip] = self.vip_flow_count.get(src_vip, 0) + 1
+
+        # Install reverse flow: dst_real -> real_src becomes dst_real -> src_vip
+        src_real_mac = self.host_ip_to_mac.get(real_src)
+        if src_real_mac:
+            match_rev = self._build_ip_match(parser, pkt, dst_real, real_src, reverse_l4=True)
+            src_vip_mac = self.vip_mac_map.get(src_vip)
+            if src_vip_mac:
+                actions_rev = [
+                    parser.OFPActionSetField(ipv4_dst=src_vip),  # Reverse DNAT: real -> VIP
+                    # Packet is delivered to the real host owning src_vip, so L2 dst must be
+                    # that host's MAC (not the VIP virtual MAC) to avoid NIC-level drops.
+                    parser.OFPActionSetField(eth_dst=src_real_mac),
+                    parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD))
+                ]
+                cookie_rev = self._session_cookie(src_vip, pkt, ip4, "rev")
+                self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
+                              cookie=cookie_rev, idle_timeout=60)
+                self.vip_active_sessions.add(src_vip)
+                self.vip_flow_count[src_vip] = self.vip_flow_count.get(src_vip, 0) + 1
+
+    def _handle_vip_to_vip(self, msg, dp, pkt, ip4, eth, in_port, dpid, src_vip, dst_vip):
+        """Handle traffic between VIPs: already translated, just forward."""
+        parser = dp.ofproto_parser
+        ofp = dp.ofproto
+
+        real_dst = self.vip_owner.get(dst_vip)
+        if not real_dst:
+            out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
+            return
+
+        now_pkt = time()
+        self.vip_last_seen[src_vip] = now_pkt
+        self.vip_last_seen[dst_vip] = now_pkt
+
+        dst_vip_mac = self.vip_mac_map.get(dst_vip)
+        if not dst_vip_mac:
+            out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
+            return
+
+        dst_real_mac = self.host_ip_to_mac.get(real_dst)
+        if not dst_real_mac:
+            out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
+            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
+            return
+
+        # Install flow: src_vip -> dst_vip becomes src_vip -> real_dst
+        match = self._build_ip_match(parser, pkt, src_vip, dst_vip)
+        actions = [
+            parser.OFPActionSetField(ipv4_dst=real_dst),
+            parser.OFPActionSetField(eth_dst=dst_real_mac),
+            parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(dst_real_mac, ofp.OFPP_FLOOD))
+        ]
+        # CRITICAL: Update vip_last_seen for BOTH VIPs before sending packet
+        now_pkt = time()
+        self.vip_last_seen[src_vip] = now_pkt
+        self.vip_last_seen[dst_vip] = now_pkt
+        
+        # CRITICAL: Send packet out FIRST for TCP SYN and other first packets
+        self._send_packet_out(msg, dp, in_port, actions)
+        # Now install flow for subsequent packets
+        cookie_fwd = self._session_cookie(dst_vip, pkt, ip4, "fwd")
+        self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
+                      cookie=cookie_fwd, idle_timeout=60)
+        self.vip_active_sessions.add(dst_vip)
+        self.vip_flow_count[dst_vip] = self.vip_flow_count.get(dst_vip, 0) + 1
+
+        # Install reverse flow: real_dst -> src_vip becomes dst_vip -> src_vip
+        real_src = self.vip_owner.get(src_vip)
+        if real_src:
+            src_real_mac = self.host_ip_to_mac.get(real_src)
+            src_vip_mac = self.vip_mac_map.get(src_vip)
+            if src_real_mac and src_vip_mac:
+                match_rev = self._build_ip_match(parser, pkt, real_dst, src_vip, reverse_l4=True)
+                actions_rev = [
+                    parser.OFPActionSetField(ipv4_src=real_dst),  # Keep source as real IP for host TCP/UDP compatibility
+                    parser.OFPActionSetField(ipv4_dst=src_vip),  # Keep destination as VIP
+                    parser.OFPActionSetField(eth_src=dst_vip_mac),
+                    # Forwarding is to real_src's attachment port, so destination MAC must be
+                    # the real host MAC, not the virtual VIP MAC.
+                    parser.OFPActionSetField(eth_dst=src_real_mac),
+                    parser.OFPActionOutput(self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD))
+                ]
+                cookie_rev = self._session_cookie(src_vip, pkt, ip4, "rev")
+                self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
+                              cookie=cookie_rev, idle_timeout=60)
+                self.vip_active_sessions.add(src_vip)
+                self.vip_active_sessions.add(dst_vip)
+                self.vip_flow_count[src_vip] = self.vip_flow_count.get(src_vip, 0) + 1
+                self.vip_flow_count[dst_vip] = self.vip_flow_count.get(dst_vip, 0) + 1
+
+    def _forward_packet(self, msg, dp, in_port, dpid, dst_mac, out_port):
+        """Forward packet without modification."""
+        parser = dp.ofproto_parser
+        ofp = dp.ofproto
+        actions = [parser.OFPActionOutput(out_port)]
+        self._send_packet_out(msg, dp, in_port, actions)
+
+    def _send_packet_out(self, msg, dp, in_port, actions):
+        """Send packet-out message."""
+        parser = dp.ofproto_parser
+        ofp = dp.ofproto
+        data = msg.data if msg.buffer_id == ofp.OFP_NO_BUFFER else None
+        out = parser.OFPPacketOut(
+            datapath=dp,
+            buffer_id=msg.buffer_id,
+            in_port=in_port,
+            actions=actions,
+            data=data,
+        )
+        dp.send_msg(out)
