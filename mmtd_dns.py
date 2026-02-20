@@ -40,7 +40,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     # For GRACE VIPs: If idle when moved to GRACE, reclaim immediately
     #                 If active when moved to GRACE, keep until session ends, then reclaim immediately
     GRACE_PERIOD = 60  # Seconds of inactivity for PRIMARY VIPs to be considered idle
-    GRACE_IDLE_THRESHOLD = 30  # Seconds - if GRACE VIP has no traffic for this, session ended, reclaim immediately
     DISCOVERY_RANGE_LAST_OCTET_MAX = 10
     VIP_POOL_START = "10.0.0.11"
 
@@ -76,6 +75,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         
         # Activity tracking (simpler - just track last packet seen)
         self.vip_last_seen: Dict[str, float] = {}  # VIP -> Last time VIP was seen in traffic
+        self.vip_flow_refs: Dict[str, int] = {}  # VIP -> Number of installed dataplane flows still alive
         
         # VIP resource pool
         self.Resources: List[str] = self._generate_vips(self.VIP_POOL_START, self.NUM_VIPS)
@@ -114,18 +114,15 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                 self._reclaim_vip(vip)
                 continue
             
-            idle_time = now - last_seen
-            # For GRACE VIPs: if no traffic for GRACE_IDLE_THRESHOLD, session ended, reclaim immediately
-            # This is shorter than GRACE_PERIOD because we want to detect session end quickly
-            if idle_time >= self.GRACE_IDLE_THRESHOLD:
-                # Session ended (no traffic for threshold) - reclaim immediately
-                self.logger.info("RECLAIM: VIP %s session ended (idle for %.1fs >= %ds), reclaiming immediately", 
-                                vip, idle_time, self.GRACE_IDLE_THRESHOLD)
+            flow_refs = self.vip_flow_refs.get(vip, 0)
+            if flow_refs <= 0:
+                # No active dataplane flows left for this GRACE VIP => session ended
+                self.logger.info("RECLAIM: VIP %s session ended (no active flows), reclaiming immediately", vip)
                 self._delete_flows_by_cookie(vip)
                 self._reclaim_vip(vip)
             else:
-                # VIP still has active session (recent traffic) - keep in GRACE
-                self.logger.debug("GRACE: VIP %s still active (seen %.1fs ago), keeping", vip, idle_time)
+                # VIP still has active session flows - keep in GRACE
+                self.logger.debug("GRACE: VIP %s still active (%d flow refs), keeping", vip, flow_refs)
         
         # Log VIP pools
         self._log_vip_pools(now)
@@ -192,6 +189,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                 self.logger.info("FLOW_DELETE: Deleted flows for VIP %s", vip)
             except Exception as e:
                 self.logger.warning("FLOW_DELETE: Failed to delete flows for VIP %s: %s", vip, e)
+        self.vip_flow_refs[vip] = 0
 
     def _add_flow(self, dp, priority, match, actions, table_id=0, idle_timeout=0, hard_timeout=0, buffer_id=None, cookie=0):
         """Install a flow rule on the switch."""
@@ -213,6 +211,26 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             buffer_id=buffer_id,
         )
         dp.send_msg(mod)
+        if cookie & self.COOKIE_BASE:
+            vip = self._cookie_vip_ip(cookie)
+            self.vip_flow_refs[vip] = self.vip_flow_refs.get(vip, 0) + 1
+
+    @set_ev_cls(ofp_event.EventOFPFlowRemoved, MAIN_DISPATCHER)
+    def _flow_removed(self, ev):
+        msg = ev.msg
+        cookie = msg.cookie
+        if not (cookie & self.COOKIE_BASE):
+            return
+
+        vip = self._cookie_vip_ip(cookie)
+        if vip not in self.vip_owner:
+            return
+
+        self.vip_flow_refs[vip] = max(0, self.vip_flow_refs.get(vip, 0) - 1)
+        if self.vip_state.get(vip) == self.VIP_STATE_GRACE and self.vip_flow_refs.get(vip, 0) == 0:
+            self.logger.info("RECLAIM: VIP %s session ended (flow removed), reclaiming immediately", vip)
+            self._delete_flows_by_cookie(vip)
+            self._reclaim_vip(vip)
 
     def _take_resource_vip(self) -> Optional[str]:
         """Take a VIP from the resource pool."""
@@ -464,6 +482,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.vip_mac_map.pop(vip, None)
         self.vip_created_at.pop(vip, None)
         self.vip_last_seen.pop(vip, None)
+        self.vip_flow_refs.pop(vip, None)
 
         if self.primary_vip.get(owner) == vip:
             self.primary_vip.pop(owner, None)
@@ -637,6 +656,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.vip_last_seen[dst_vip] = now_pkt
 
         src_vip_mac = self.vip_mac_map.get(src_vip)
+        dst_vip_mac = self.vip_mac_map.get(dst_vip)
         dst_real_mac = self.host_ip_to_mac.get(dst_real)
 
         if not src_vip_mac:
@@ -681,7 +701,9 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         if src_real_mac:
             src_port = self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD)
             actions_rev = [
+                parser.OFPActionSetField(ipv4_src=dst_vip),
                 parser.OFPActionSetField(ipv4_dst=src_real),  # Keep destination as real IP
+                parser.OFPActionSetField(eth_src=dst_vip_mac if dst_vip_mac else eth.src),
                 parser.OFPActionSetField(eth_dst=src_real_mac),
                 parser.OFPActionOutput(src_port)
             ]
@@ -722,6 +744,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             return
 
         src_vip_mac = self.vip_mac_map.get(src_vip)
+        dst_vip_mac = self.vip_mac_map.get(dst_vip)
         dst_real_mac = self.host_ip_to_mac.get(real_dst)
         
         if not src_vip_mac or not dst_real_mac:
@@ -761,7 +784,9 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         if src_real_mac:
             src_port = self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD)
             actions_rev = [
+                parser.OFPActionSetField(ipv4_src=dst_vip),
                 parser.OFPActionSetField(ipv4_dst=src_real),  # Reverse DNAT
+                parser.OFPActionSetField(eth_src=dst_vip_mac if dst_vip_mac else eth.src),
                 parser.OFPActionSetField(eth_dst=src_real_mac),
                 parser.OFPActionOutput(src_port)
             ]
@@ -787,8 +812,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         parser = dp.ofproto_parser
         ofp = dp.ofproto
 
-        real_src = self.vip_owner.get(src_vip)
-        if not real_src:
+        if src_vip not in self.vip_owner:
             self._forward_packet(msg, dp, in_port, dpid, eth.dst, ofp.OFPP_FLOOD)
             return
 
@@ -800,7 +824,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         # Reverse SNAT: VIP → real
         dst_port = self.mac_to_port.get(dpid, {}).get(dst_real_mac, ofp.OFPP_FLOOD)
         actions = [
-            parser.OFPActionSetField(ipv4_src=real_src),  # Reverse SNAT
             parser.OFPActionSetField(eth_dst=dst_real_mac),
             parser.OFPActionOutput(dst_port)
         ]
@@ -820,8 +843,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
                       cookie=cookie, idle_timeout=60)
         
-        self.logger.debug("VIP-TO-REAL: %s (VIP) -> %s (translated from %s)", 
-                         src_vip, dst_real, real_src)
+        self.logger.debug("VIP-TO-REAL: %s (VIP) -> %s", src_vip, dst_real)
 
     def _handle_vip_to_vip(self, msg, dp, pkt, ip4, eth, in_port, dpid, src_vip, dst_vip):
         """
