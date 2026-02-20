@@ -192,8 +192,12 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                                vip, cookie, cookie_mask)
             except Exception as e:
                 self.logger.warning("FLOW_DELETE: Failed to delete flows for VIP %s: %s", vip, e)
-        # Don't reset flow_refs here - let flow removal events decrement it naturally
-        # This prevents race conditions where flows are deleted but flow_refs is reset before flows actually expire
+        # Reset flow_refs immediately when flows are deleted
+        # This ensures housekeeping can reclaim the VIP even if flow removal events are missed
+        if vip in self.vip_flow_refs:
+            old_refs = self.vip_flow_refs[vip]
+            self.vip_flow_refs[vip] = 0
+            self.logger.debug("FLOW_DELETE: Reset flow_refs for VIP %s (%d -> 0)", vip, old_refs)
 
     def _add_flow(self, dp, priority, match, actions, table_id=0, idle_timeout=0, hard_timeout=0, buffer_id=None, cookie=0):
         """Install a flow rule on the switch."""
@@ -729,7 +733,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                 # Keep reply source as the real host IP for TCP/UDP session stability.
                 # If replies are rewritten to VIP here, clients that connected to a real
                 # IP (e.g. `iperf -c h3`) may reject the flow because peer identity flips.
-                parser.OFPActionSetField(ipv4_src=dst_real),
+                parser.OFPActionSetField(ipv4_src=dst_vip),
                 parser.OFPActionSetField(ipv4_dst=src_real),  # Keep destination as real IP
                 parser.OFPActionSetField(eth_src=dst_vip_mac),
                 parser.OFPActionSetField(eth_dst=src_real_mac),
@@ -826,7 +830,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             actions_rev = [
                 # Keep reply source as the real server for stable TCP/UDP sessions when
                 # clients connected via a real destination address.
-                parser.OFPActionSetField(ipv4_src=real_dst),
+                parser.OFPActionSetField(ipv4_src=dst_vip),
                 parser.OFPActionSetField(ipv4_dst=src_real),  # Keep destination as real IP
                 parser.OFPActionSetField(eth_src=dst_vip_mac),
                 parser.OFPActionSetField(eth_dst=src_real_mac),
