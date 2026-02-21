@@ -27,7 +27,6 @@ from ryu.ofproto import ofproto_v1_3
 class EventMessage(event.EventBase):
     def __init__(self, message: str):
         super(EventMessage, self).__init__()
-        self.msg = message
 
 
 class MovingTargetDefenseDNS(app_manager.RyuApp):
@@ -37,12 +36,8 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     NUM_VIPS = 244
     HOUSEKEEPING_INTERVAL = 15
     ROTATE_INTERVAL = 60
-    # IDLE_THRESHOLD: VIP is considered idle if no traffic for this duration (5s)
-    # GRACE VIPs: If idle when moved to GRACE, reclaim immediately (return to pool)
-    #             If active when moved to GRACE, keep until idle or session ends
-    GRACE_PERIOD = 60  # Seconds - PRIMARY VIP rotation interval
-    IDLE_THRESHOLD = 5  # Seconds - VIP is considered idle if no traffic for this duration
-    GRACE_IDLE_THRESHOLD = 5  # Seconds - if GRACE VIP has no flows AND no traffic for this, session ended, reclaim immediately
+    # GRACE VIPs: If idle when moved to GRACE (flow_refs = 0), reclaim immediately (return to pool)
+    #             If active when moved to GRACE (flow_refs > 0), keep until flows end
     DISCOVERY_RANGE_LAST_OCTET_MAX = 10
     VIP_POOL_START = "10.0.0.11"
 
@@ -53,7 +48,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
 
     VIP_STATE_PRIMARY = "PRIMARY"
     VIP_STATE_GRACE = "GRACE"
-    VIP_STATE_RECLAIMED = "RECLAIMED"
 
     def __init__(self, *args, **kwargs):
         super(MovingTargetDefenseDNS, self).__init__(*args, **kwargs)
@@ -65,19 +59,16 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         # Host discovery and mapping
         self.detected_hosts: Set[str] = set()  # Set of discovered real host IPs (10.0.0.1-10.0.0.10)
         self.host_ip_to_mac: Dict[str, str] = {}  # Real host IP -> MAC address
-        self.host_mac_to_ip: Dict[str, str] = {}  # MAC address -> Real host IP
-        self.host_attachments: Dict[str, int] = {}  # Real host IP -> dpid
         
         # VIP assignment and state
         self.primary_vip: Dict[str, str] = {}  # Real host IP -> Primary VIP assigned to that host
         self.vip_owner: Dict[str, str] = {}  # VIP -> Real host IP (reverse mapping)
-        self.vip_state: Dict[str, str] = {}  # VIP -> State (PRIMARY, GRACE, RECLAIMED)
+        self.vip_state: Dict[str, str] = {}  # VIP -> State (PRIMARY, GRACE)
         self.vip_mac_map: Dict[str, str] = {}  # VIP -> Generated MAC address for that VIP
         self.vip_created_at: Dict[str, float] = {}  # VIP -> Timestamp when VIP was created/assigned
         self.host_vip_pools: Dict[str, Set[str]] = {}  # Real host IP -> Set of all VIPs assigned to that host
         
-        # Activity tracking (simpler - just track last packet seen)
-        self.vip_last_seen: Dict[str, float] = {}  # VIP -> Last time VIP was seen in traffic
+        # Activity tracking
         self.vip_flow_refs: Dict[str, int] = {}  # VIP -> Number of installed dataplane flows still alive
         
         # VIP resource pool
@@ -192,12 +183,8 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                                vip, cookie, cookie_mask)
             except Exception as e:
                 self.logger.warning("FLOW_DELETE: Failed to delete flows for VIP %s: %s", vip, e)
-        # Reset flow_refs immediately when flows are deleted
-        # This ensures housekeeping can reclaim the VIP even if flow removal events are missed
-        if vip in self.vip_flow_refs:
-            old_refs = self.vip_flow_refs[vip]
-            self.vip_flow_refs[vip] = 0
-            self.logger.debug("FLOW_DELETE: Reset flow_refs for VIP %s (%d -> 0)", vip, old_refs)
+        # Don't reset flow_refs here - let flow removal events decrement it naturally
+        # This prevents race conditions where flows are deleted but flow_refs is reset before flows actually expire
 
     def _add_flow(self, dp, priority, match, actions, table_id=0, idle_timeout=0, hard_timeout=0, buffer_id=None, cookie=0):
         """Install a flow rule on the switch."""
@@ -243,9 +230,11 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.logger.debug("FLOW_REMOVED: VIP %s flow expired (refs: %d -> %d, state=%s)", 
                          vip, old_refs, new_refs, self.vip_state.get(vip, "UNKNOWN"))
         
-        # If GRACE VIP has no flows left, housekeeping will reclaim it
+        # If GRACE VIP has no flows left, reclaim immediately
         if self.vip_state.get(vip) == self.VIP_STATE_GRACE and new_refs == 0:
-            self.logger.info("FLOW_REMOVED: VIP %s (GRACE) all flows expired, will be reclaimed in housekeeping", vip)
+            self.logger.info("FLOW_REMOVED: VIP %s (GRACE) all flows expired, reclaiming immediately", vip)
+            self._delete_flows_by_cookie(vip)
+            self._reclaim_vip(vip)
 
     def _take_resource_vip(self) -> Optional[str]:
         """Take a VIP from the resource pool."""
@@ -345,8 +334,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         # Update host info
         if mac:
             self.host_ip_to_mac[real_ip] = mac
-            self.host_mac_to_ip[mac] = real_ip
-        self.host_attachments[real_ip] = dpid
 
         # New host discovered
         if real_ip not in self.detected_hosts:
@@ -500,7 +487,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.vip_state.pop(vip, None)
         self.vip_mac_map.pop(vip, None)
         self.vip_created_at.pop(vip, None)
-        self.vip_last_seen.pop(vip, None)
         self.vip_flow_refs.pop(vip, None)
 
         if self.primary_vip.get(owner) == vip:
@@ -585,13 +571,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self._learn_host(pkt, dpid)
         src_ip, dst_ip = ip4.src, ip4.dst
 
-        # Update VIP activity tracking
-        now_pkt = time()
-        if dst_ip in self.vip_owner:
-            self.vip_last_seen[dst_ip] = now_pkt
-        if src_ip in self.vip_owner:
-            self.vip_last_seen[src_ip] = now_pkt
-
         # DNS-based approach: 
         # - Hosts resolve destinations to VIPs via DNS
         # - Hosts send: src=real_ip, dst=VIP
@@ -669,11 +648,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             self._forward_packet(msg, dp, in_port, dpid, eth.dst, ofp.OFPP_FLOOD)
             return
 
-        # Update VIP activity tracking
-        now_pkt = time()
-        self.vip_last_seen[src_vip] = now_pkt
-        self.vip_last_seen[dst_vip] = now_pkt
-
         src_vip_mac = self._ensure_vip_mac(src_vip)
         dst_vip_mac = self._ensure_vip_mac(dst_vip)
         dst_real_mac = self.host_ip_to_mac.get(dst_real)
@@ -710,14 +684,19 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             **forward_l4_match,
         )
 
+        # Send first packet immediately (critical for TCP SYN)
         self._send_packet_out(msg, dp, in_port, actions)
         cookie = self._vip_cookie(src_vip)
+        # Install flow for subsequent packets
         self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
-                      cookie=cookie, idle_timeout=60)
+                      cookie=cookie, idle_timeout=5)
+        self.logger.debug("REAL-TO-REAL: Installed forward flow for TCP/UDP: %s -> %s (VIP: %s -> %s)", 
+                         src_real, dst_real, src_vip, dst_real)
 
-        # Install reverse flow: dst_real → src_real (reply path)
-        # When h2 replies, it sends: src=dst_real, dst=src_real (real IPs)
-        # We need to match this and translate source to VIP
+        # Install reverse flow: dst_real → src_vip (reply path)
+        # Forward flow sends to real host: src=src_vip, dst=dst_real
+        # Real host receives and replies: src=dst_real, dst=src_vip (replies to VIP it received)
+        # We need to match this and translate: src=dst_real→dst_vip, dst=src_vip→src_real
         # CRITICAL: Reverse flow must be installed with dst_vip cookie to track flow_refs for destination VIP
         src_real_mac = self.host_ip_to_mac.get(src_real) or eth.src
         if src_real_mac:
@@ -730,21 +709,19 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         if src_real_mac and dst_vip_mac:
             src_port = self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD)
             actions_rev = [
-                # Keep reply source as the real host IP for TCP/UDP session stability.
-                # If replies are rewritten to VIP here, clients that connected to a real
-                # IP (e.g. `iperf -c h3`) may reject the flow because peer identity flips.
-                parser.OFPActionSetField(ipv4_src=dst_vip),
-                parser.OFPActionSetField(ipv4_dst=src_real),  # Keep destination as real IP
+                # Translate reply source to VIP so host sees VIP in replies
+                parser.OFPActionSetField(ipv4_src=dst_vip),  # SNAT: real → VIP (so host sees VIP in reply)
+                parser.OFPActionSetField(ipv4_dst=src_real),  # DNAT: VIP → real (so host receives it)
                 parser.OFPActionSetField(eth_src=dst_vip_mac),
                 parser.OFPActionSetField(eth_dst=src_real_mac),
                 parser.OFPActionOutput(src_port)
             ]
-            # Match reply: src=dst_real, dst=src_real (with swapped ports/types for TCP/UDP/ICMP)
+            # Match reply: src=dst_real, dst=src_vip (real host replies to VIP it received)
+            # Note: Don't constrain in_port - reply may come from different switch/port
             match_rev = parser.OFPMatch(
                 eth_type=0x0800,
                 ipv4_src=dst_real,
-                ipv4_dst=src_real,  # Match real IP (not VIP) - reply has real IP
-                in_port=dst_port,  # Reply comes from dst_port
+                ipv4_dst=src_vip,  # Real host replies to VIP (the source VIP it received)
                 **reverse_l4_match,
             )
             # Reverse flow translates source to dst_vip, so use dst_vip cookie to track flow_refs
@@ -752,7 +729,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             self.logger.debug("REAL-TO-REAL: Installing reverse flow for dst_vip=%s (cookie=0x%016x) to track flow_refs", 
                              dst_vip, cookie_rev)
             self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
-                          cookie=cookie_rev, idle_timeout=60)
+                          cookie=cookie_rev, idle_timeout=5)
 
         self.logger.debug("REAL-TO-REAL: %s -> %s (translated to %s -> %s)", 
                          src_real, dst_real, src_vip, dst_real)
@@ -810,14 +787,19 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             **forward_l4_match,
         )
         
+        # Send first packet immediately (critical for TCP SYN)
         self._send_packet_out(msg, dp, in_port, actions)
         cookie = self._vip_cookie(src_vip)
+        # Install flow for subsequent packets
         self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
-                      cookie=cookie, idle_timeout=60)
+                      cookie=cookie, idle_timeout=5)
+        self.logger.debug("REAL-TO-VIP: Installed forward flow for TCP/UDP: %s -> %s (VIP: %s -> %s)", 
+                         src_real, dst_vip, src_vip, real_dst)
         
-        # Install reverse flow: real_dst → src_real (reply path)
-        # When h2 replies, it sends: src=real_dst, dst=src_real (real IPs)
-        # We need to match this and translate source to VIP
+        # Install reverse flow: real_dst → src_vip (reply path)
+        # Forward flow sends to real host: src=src_vip, dst=real_dst
+        # Real host receives and replies: src=real_dst, dst=src_vip (replies to VIP it received)
+        # We need to match this and translate: src=real_dst→dst_vip, dst=src_vip→src_real
         src_real_mac = self.host_ip_to_mac.get(src_real) or eth.src
         if src_real_mac:
             self.host_ip_to_mac[src_real] = src_real_mac
@@ -828,20 +810,19 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         if src_real_mac and dst_vip_mac:
             src_port = self.mac_to_port.get(dpid, {}).get(src_real_mac, ofp.OFPP_FLOOD)
             actions_rev = [
-                # Keep reply source as the real server for stable TCP/UDP sessions when
-                # clients connected via a real destination address.
-                parser.OFPActionSetField(ipv4_src=dst_vip),
-                parser.OFPActionSetField(ipv4_dst=src_real),  # Keep destination as real IP
+                # Translate reply source to VIP so host sees VIP in replies
+                parser.OFPActionSetField(ipv4_src=dst_vip),  # SNAT: real → VIP (so host sees VIP in reply)
+                parser.OFPActionSetField(ipv4_dst=src_real),  # DNAT: VIP → real (so host receives it)
                 parser.OFPActionSetField(eth_src=dst_vip_mac),
                 parser.OFPActionSetField(eth_dst=src_real_mac),
                 parser.OFPActionOutput(src_port)
             ]
-            # Match reply: src=real_dst, dst=src_real (with swapped ports/types for TCP/UDP/ICMP)
+            # Match reply: src=real_dst, dst=src_vip (real host replies to VIP it received)
+            # Note: Don't constrain in_port - reply may come from different switch/port
             match_rev = parser.OFPMatch(
                 eth_type=0x0800,
                 ipv4_src=real_dst,
-                ipv4_dst=src_real,  # Match real IP (not VIP) - reply has real IP
-                in_port=dst_port,  # Reply comes from dst_port
+                ipv4_dst=src_vip,  # Real host replies to VIP (the source VIP it received)
                 **reverse_l4_match,
             )
             # Reverse flow translates source to dst_vip, so use dst_vip cookie to track flow_refs
@@ -849,7 +830,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             self.logger.debug("REAL-TO-VIP: Installing reverse flow for dst_vip=%s (cookie=0x%016x) to track flow_refs", 
                              dst_vip, cookie_rev)
             self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
-                          cookie=cookie_rev, idle_timeout=60)
+                          cookie=cookie_rev, idle_timeout=5)
         
         self.logger.debug("REAL-TO-VIP: %s -> %s (translated to %s -> %s)", 
                          src_real, dst_vip, src_vip, real_dst)
@@ -891,7 +872,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self._send_packet_out(msg, dp, in_port, actions)
         cookie = self._vip_cookie(src_vip)
         self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
-                      cookie=cookie, idle_timeout=60)
+                      cookie=cookie, idle_timeout=5)
         
         self.logger.debug("VIP-TO-REAL: %s (VIP) -> %s", src_vip, dst_real)
 
@@ -933,7 +914,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self._send_packet_out(msg, dp, in_port, actions)
         cookie = self._vip_cookie(dst_vip)
         self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
-                      cookie=cookie, idle_timeout=60)
+                      cookie=cookie, idle_timeout=5)
 
     def _extract_l4_match_fields(self, pkt, ip4):
         """Build protocol-aware OpenFlow match fields for forward and reverse directions."""
