@@ -14,7 +14,7 @@ Design:
 
 import socket
 from time import time
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from ryu.base import app_manager
 from ryu.controller import event, ofp_event
@@ -36,6 +36,10 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     NUM_VIPS = 244
     HOUSEKEEPING_INTERVAL = 15
     ROTATE_INTERVAL = 60
+    TCP_SYN_SEEN_TIMEOUT = 15
+    TCP_ESTABLISHED_TIMEOUT = 180
+    TCP_CLOSING_TIMEOUT = 8
+    UDP_ACTIVE_TIMEOUT = 30
     # GRACE VIPs: If idle when moved to GRACE (flow_refs = 0), reclaim immediately (return to pool)
     #             If active when moved to GRACE (flow_refs > 0), keep until flows end
     DISCOVERY_RANGE_LAST_OCTET_MAX = 10
@@ -48,6 +52,10 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
 
     VIP_STATE_PRIMARY = "PRIMARY"
     VIP_STATE_GRACE = "GRACE"
+    SESSION_TCP_SYN_SEEN = "SYN_SEEN"
+    SESSION_TCP_ESTABLISHED = "ESTABLISHED"
+    SESSION_TCP_CLOSING = "CLOSING"
+    SESSION_UDP_ACTIVE = "ACTIVE"
 
     def __init__(self, *args, **kwargs):
         super(MovingTargetDefenseDNS, self).__init__(*args, **kwargs)
@@ -70,6 +78,10 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         
         # Activity tracking
         self.vip_flow_refs: Dict[str, int] = {}  # VIP -> Number of installed dataplane flows still alive
+        self.vip_session_refs: Dict[str, int] = {}  # VIP -> Active controller-side sessions pinned to VIP
+
+        # L4 session handling for TCP/UDP NAT consistency
+        self.session_table: Dict[Tuple[str, str, int, int, int], Dict[str, object]] = {}
         
         # VIP resource pool
         self.Resources: List[str] = self._generate_vips(self.VIP_POOL_START, self.NUM_VIPS)
@@ -106,14 +118,23 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             
             flow_refs = self.vip_flow_refs.get(vip, 0)
             
-            if flow_refs <= 0:
+            session_refs = self.vip_session_refs.get(vip, 0)
+
+            if flow_refs <= 0 and session_refs <= 0:
                 # No active flows = VIP is idle - reclaim immediately (return to pool)
                 self.logger.info("RECLAIM: VIP %s is idle (no active flows), reclaiming immediately", vip)
                 self._delete_flows_by_cookie(vip)
                 self._reclaim_vip(vip)
             else:
                 # VIP has active flows - keep in GRACE until flows end
-                self.logger.debug("GRACE: VIP %s still active (%d flow refs), keeping", vip, flow_refs)
+                self.logger.debug(
+                    "GRACE: VIP %s still active (%d flow refs, %d session refs), keeping",
+                    vip,
+                    flow_refs,
+                    session_refs,
+                )
+
+        self._expire_sessions(now)
         
         # Log VIP pools
         self._log_vip_pools(now)
@@ -230,8 +251,12 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.logger.debug("FLOW_REMOVED: VIP %s flow expired (refs: %d -> %d, state=%s)", 
                          vip, old_refs, new_refs, self.vip_state.get(vip, "UNKNOWN"))
         
-        # If GRACE VIP has no flows left, reclaim immediately
-        if self.vip_state.get(vip) == self.VIP_STATE_GRACE and new_refs == 0:
+        # If GRACE VIP has no flows/sessions left, reclaim immediately
+        if (
+            self.vip_state.get(vip) == self.VIP_STATE_GRACE
+            and new_refs == 0
+            and self.vip_session_refs.get(vip, 0) == 0
+        ):
             self.logger.info("FLOW_REMOVED: VIP %s (GRACE) all flows expired, reclaiming immediately", vip)
             self._delete_flows_by_cookie(vip)
             self._reclaim_vip(vip)
@@ -253,6 +278,207 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.logger.info("BIND: host=%s vip=%s", host_ip, vip)
         # Update DNS mapping file
         self._update_dns_mapping()
+
+    def _pin_vip_session(self, vip: str):
+        if not vip:
+            return
+        self.vip_session_refs[vip] = self.vip_session_refs.get(vip, 0) + 1
+
+    def _unpin_vip_session(self, vip: str):
+        if not vip:
+            return
+        self.vip_session_refs[vip] = max(0, self.vip_session_refs.get(vip, 0) - 1)
+
+    def _deterministic_client_vip(self, client_real_ip: str) -> Optional[str]:
+        """Pick deterministic source VIP for a client at session creation."""
+        return self.primary_vip.get(client_real_ip)
+
+    def _session_key(self, src_ip: str, dst_vip: str, proto: int, src_port: int, dst_port: int) -> Tuple[str, str, int, int, int]:
+        return (src_ip, dst_vip, proto, src_port, dst_port)
+
+    def _expire_sessions(self, now: float):
+        expired = []
+        for key, sess in self.session_table.items():
+            expires_at = sess.get("expires_at", 0)
+            if expires_at <= now:
+                expired.append(key)
+        for key in expired:
+            sess = self.session_table.pop(key, None)
+            if not sess:
+                continue
+            self._unpin_vip_session(str(sess.get("client_src_vip", "")))
+            self._unpin_vip_session(str(sess.get("server_reply_vip", "")))
+
+    def _update_tcp_session_state(self, sess: Dict[str, object], tcp_pkt: Optional[tcp.tcp], now: float):
+        if not tcp_pkt:
+            return
+        bits = int(tcp_pkt.bits)
+        syn = bool(bits & tcp.TCP_SYN)
+        ack = bool(bits & tcp.TCP_ACK)
+        fin = bool(bits & tcp.TCP_FIN)
+        rst = bool(bits & tcp.TCP_RST)
+
+        if rst or fin:
+            sess["state"] = self.SESSION_TCP_CLOSING
+            sess["expires_at"] = now + self.TCP_CLOSING_TIMEOUT
+        elif syn and not ack and sess.get("state") != self.SESSION_TCP_ESTABLISHED:
+            sess["state"] = self.SESSION_TCP_SYN_SEEN
+            sess["expires_at"] = now + self.TCP_SYN_SEEN_TIMEOUT
+        else:
+            sess["state"] = self.SESSION_TCP_ESTABLISHED
+            sess["expires_at"] = now + self.TCP_ESTABLISHED_TIMEOUT
+
+    def _flow_idle_timeout_for_session(self, sess: Dict[str, object]) -> int:
+        proto = int(sess["proto"])
+        if proto == socket.IPPROTO_UDP:
+            return self.UDP_ACTIVE_TIMEOUT
+        state = str(sess.get("state", self.SESSION_TCP_SYN_SEEN))
+        if state == self.SESSION_TCP_CLOSING:
+            return self.TCP_CLOSING_TIMEOUT
+        if state == self.SESSION_TCP_ESTABLISHED:
+            return self.TCP_ESTABLISHED_TIMEOUT
+        return self.TCP_SYN_SEEN_TIMEOUT
+
+    def _extract_l4_info(self, pkt, ip4) -> Optional[Dict[str, object]]:
+        tcp_pkt = pkt.get_protocol(tcp.tcp)
+        if tcp_pkt:
+            return {
+                "proto": socket.IPPROTO_TCP,
+                "src_port": tcp_pkt.src_port,
+                "dst_port": tcp_pkt.dst_port,
+                "forward": {"ip_proto": socket.IPPROTO_TCP, "tcp_src": tcp_pkt.src_port, "tcp_dst": tcp_pkt.dst_port},
+                "reverse": {"ip_proto": socket.IPPROTO_TCP, "tcp_src": tcp_pkt.dst_port, "tcp_dst": tcp_pkt.src_port},
+                "tcp": tcp_pkt,
+            }
+        udp_pkt = pkt.get_protocol(udp.udp)
+        if udp_pkt:
+            return {
+                "proto": socket.IPPROTO_UDP,
+                "src_port": udp_pkt.src_port,
+                "dst_port": udp_pkt.dst_port,
+                "forward": {"ip_proto": socket.IPPROTO_UDP, "udp_src": udp_pkt.src_port, "udp_dst": udp_pkt.dst_port},
+                "reverse": {"ip_proto": socket.IPPROTO_UDP, "udp_src": udp_pkt.dst_port, "udp_dst": udp_pkt.src_port},
+                "tcp": None,
+            }
+        return None
+
+    def _install_session_flows(self, msg, dp, parser, in_port, l4_info, sess, src_real_mac, dst_real_mac):
+        ofp = dp.ofproto
+        client_ip = str(sess["client_real_ip"])
+        server_vip = str(sess["server_vip"])
+        client_vip = str(sess["client_src_vip"])
+        server_real = str(sess["server_real_ip"])
+        server_reply_vip = str(sess["server_reply_vip"])
+
+        src_vip_mac = self._ensure_vip_mac(client_vip)
+        dst_vip_mac = self._ensure_vip_mac(server_reply_vip)
+        if not src_vip_mac or not dst_vip_mac:
+            self.logger.warning("SESSION: Missing VIP MAC(s) for %s -> %s", client_vip, server_reply_vip)
+            return False
+
+        dst_port = self.mac_to_port.get(dp.id, {}).get(dst_real_mac, ofp.OFPP_FLOOD)
+        src_port = self.mac_to_port.get(dp.id, {}).get(src_real_mac, ofp.OFPP_FLOOD)
+
+        idle_timeout = self._flow_idle_timeout_for_session(sess)
+        actions_fwd = [
+            parser.OFPActionSetField(ipv4_src=client_vip),
+            parser.OFPActionSetField(ipv4_dst=server_real),
+            parser.OFPActionSetField(eth_src=src_vip_mac),
+            parser.OFPActionSetField(eth_dst=dst_real_mac),
+            parser.OFPActionOutput(dst_port),
+        ]
+        match_fwd = parser.OFPMatch(
+            eth_type=0x0800,
+            ipv4_src=client_ip,
+            ipv4_dst=server_vip,
+            in_port=in_port,
+            **l4_info["forward"],
+        )
+
+        self._send_packet_out(msg, dp, in_port, actions_fwd)
+        self._add_flow(
+            dp,
+            priority=self.FLOW_PRIORITY_VIP,
+            match=match_fwd,
+            actions=actions_fwd,
+            cookie=self._vip_cookie(client_vip),
+            idle_timeout=idle_timeout,
+        )
+
+        actions_rev = [
+            parser.OFPActionSetField(ipv4_src=server_reply_vip),
+            parser.OFPActionSetField(ipv4_dst=client_ip),
+            parser.OFPActionSetField(eth_src=dst_vip_mac),
+            parser.OFPActionSetField(eth_dst=src_real_mac),
+            parser.OFPActionOutput(src_port),
+        ]
+        match_rev = parser.OFPMatch(
+            eth_type=0x0800,
+            ipv4_src=server_real,
+            ipv4_dst=client_vip,
+            **l4_info["reverse"],
+        )
+        self._add_flow(
+            dp,
+            priority=self.FLOW_PRIORITY_VIP,
+            match=match_rev,
+            actions=actions_rev,
+            cookie=self._vip_cookie(server_reply_vip),
+            idle_timeout=idle_timeout,
+        )
+        return True
+
+    def _handle_l4_session(self, msg, dp, pkt, in_port, src_real, dst_vip) -> bool:
+        parser = dp.ofproto_parser
+        ip4 = pkt.get_protocol(ipv4.ipv4)
+        if not ip4:
+            return False
+        l4_info = self._extract_l4_info(pkt, ip4)
+        if not l4_info:
+            return False
+
+        real_dst = self.vip_owner.get(dst_vip)
+        if not real_dst:
+            return False
+
+        src_real_mac = self.host_ip_to_mac.get(src_real)
+        dst_real_mac = self.host_ip_to_mac.get(real_dst)
+        if not src_real_mac or not dst_real_mac:
+            return False
+
+        now = time()
+        key = self._session_key(src_real, dst_vip, int(l4_info["proto"]), int(l4_info["src_port"]), int(l4_info["dst_port"]))
+        sess = self.session_table.get(key)
+        if not sess:
+            client_vip = self._deterministic_client_vip(src_real)
+            if not client_vip:
+                return False
+            sess = {
+                "client_real_ip": src_real,
+                "server_vip": dst_vip,
+                "proto": int(l4_info["proto"]),
+                "client_port": int(l4_info["src_port"]),
+                "server_port": int(l4_info["dst_port"]),
+                "client_src_vip": client_vip,
+                "server_real_ip": real_dst,
+                "server_reply_vip": dst_vip,
+                "state": self.SESSION_UDP_ACTIVE if int(l4_info["proto"]) == socket.IPPROTO_UDP else self.SESSION_TCP_SYN_SEEN,
+                "expires_at": now + (self.UDP_ACTIVE_TIMEOUT if int(l4_info["proto"]) == socket.IPPROTO_UDP else self.TCP_SYN_SEEN_TIMEOUT),
+            }
+            self.session_table[key] = sess
+            self._pin_vip_session(client_vip)
+            self._pin_vip_session(dst_vip)
+
+        if int(l4_info["proto"]) == socket.IPPROTO_UDP:
+            sess["state"] = self.SESSION_UDP_ACTIVE
+            sess["expires_at"] = now + self.UDP_ACTIVE_TIMEOUT
+        else:
+            self._update_tcp_session_state(sess, l4_info.get("tcp"), now)
+
+        if sess.get("server_real_ip") != real_dst:
+            sess["server_real_ip"] = real_dst
+
+        return self._install_session_flows(msg, dp, parser, in_port, l4_info, sess, src_real_mac, dst_real_mac)
 
     # ---------------- switch bringup ----------------
 
@@ -289,18 +515,25 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                         continue
                     
                     self.vip_state[old_vip] = self.VIP_STATE_GRACE
-                    # Check if VIP is idle or active using flow_refs
+                    # Check if VIP is idle/active using both dataplane flows and controller sessions
                     flow_refs = self.vip_flow_refs.get(old_vip, 0)
-                    if flow_refs <= 0:
+                    session_refs = self.vip_session_refs.get(old_vip, 0)
+                    if flow_refs <= 0 and session_refs <= 0:
                         # No active flows = VIP is idle - reclaim immediately
                         self.logger.info("ROTATE: host=%s new=%s old=%s -> GRACE (idle, no flows), reclaiming immediately",
                                          host_ip, new_vip, old_vip)
                         self._delete_flows_by_cookie(old_vip)
                         self._reclaim_vip(old_vip)
                     else:
-                        # VIP has active flows - keep in GRACE until flows end
-                        self.logger.info("ROTATE: host=%s new=%s old=%s -> GRACE (active, %d flows), will reclaim when flows end",
-                                         host_ip, new_vip, old_vip, flow_refs)
+                        # VIP has active sessions/flows - keep in GRACE until both end
+                        self.logger.info(
+                            "ROTATE: host=%s new=%s old=%s -> GRACE (active, %d flows, %d sessions), will reclaim when flows/sessions end",
+                            host_ip,
+                            new_vip,
+                            old_vip,
+                            flow_refs,
+                            session_refs,
+                        )
 
     # ---------------- host discovery ----------------
 
@@ -488,6 +721,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.vip_mac_map.pop(vip, None)
         self.vip_created_at.pop(vip, None)
         self.vip_flow_refs.pop(vip, None)
+        self.vip_session_refs.pop(vip, None)
 
         if self.primary_vip.get(owner) == vip:
             self.primary_vip.pop(owner, None)
@@ -763,6 +997,9 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         if not src_vip_mac or not dst_real_mac:
             self.logger.debug("REAL-TO-VIP: Missing MACs, flooding")
             self._forward_packet(msg, dp, in_port, dpid, eth.dst, ofp.OFPP_FLOOD)
+            return
+
+        if self._handle_l4_session(msg, dp, pkt, in_port, src_real, dst_vip):
             return
 
         dst_port = self.mac_to_port.get(dpid, {}).get(dst_real_mac, ofp.OFPP_FLOOD)
