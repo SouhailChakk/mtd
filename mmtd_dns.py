@@ -83,7 +83,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.vip_session_refs: Dict[str, int] = {}  # VIP -> Active controller-side sessions pinned to VIP
         self.vip_last_seen: Dict[str, float] = {}  # VIP -> Last observed session activity
         self.quarantine_until: Dict[str, float] = {}  # VIP -> Earliest timestamp eligible for reuse
-        self.vip_delete_requested_at: Dict[str, float] = {}  # VIP -> Last cookie delete request time
 
         # L4 session handling for TCP/UDP NAT consistency
         self.session_table: Dict[Tuple[str, str, int, int, int], Dict[str, object]] = {}
@@ -781,7 +780,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.vip_flow_refs.pop(vip, None)
         self.vip_session_refs.pop(vip, None)
         self.vip_last_seen.pop(vip, None)
-        self.vip_delete_requested_at.pop(vip, None)
 
         if self.primary_vip.get(owner) == vip:
             self.primary_vip.pop(owner, None)
