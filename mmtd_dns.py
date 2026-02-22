@@ -87,6 +87,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
 
         # L4 session handling for TCP/UDP NAT consistency
         self.session_table: Dict[Tuple[str, str, int, int, int], Dict[str, object]] = {}
+        self.session_reverse_index: Dict[Tuple[str, str, int, int, int], Tuple[str, str, int, int, int]] = {}
         
         # VIP resource pool
         self.Resources: List[str] = self._generate_vips(self.VIP_POOL_START, self.NUM_VIPS)
@@ -355,6 +356,14 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             sess = self.session_table.pop(key, None)
             if not sess:
                 continue
+            reverse_key = (
+                str(sess.get("server_real_ip", "")),
+                str(sess.get("client_src_vip", "")),
+                int(sess.get("proto", 0)),
+                int(sess.get("server_port", 0)),
+                int(sess.get("client_port", 0)),
+            )
+            self.session_reverse_index.pop(reverse_key, None)
             self._unpin_vip_session(str(sess.get("client_src_vip", "")))
             self._unpin_vip_session(str(sess.get("server_reply_vip", "")))
 
@@ -501,7 +510,23 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         now = time()
         key = self._session_key(src_real, dst_vip, int(l4_info["proto"]), int(l4_info["src_port"]), int(l4_info["dst_port"]))
         sess = self.session_table.get(key)
+
         if not sess:
+            reverse_key = (src_real, dst_vip, int(l4_info["proto"]), int(l4_info["src_port"]), int(l4_info["dst_port"]))
+            canonical_key = self.session_reverse_index.get(reverse_key)
+            if canonical_key:
+                key = canonical_key
+                sess = self.session_table.get(canonical_key)
+
+        if not sess:
+            tcp_pkt = l4_info.get("tcp")
+            # Only allow TCP session creation on an opening SYN (not SYN-ACK/ACK).
+            # This avoids creating ghost sessions from reverse-direction packets.
+            if tcp_pkt:
+                bits = int(tcp_pkt.bits)
+                if not (bits & tcp.TCP_SYN) or (bits & tcp.TCP_ACK):
+                    return False
+
             client_vip = self._deterministic_client_vip(src_real)
             if not client_vip:
                 return False
@@ -518,6 +543,14 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                 "expires_at": now + (self.UDP_ACTIVE_TIMEOUT if int(l4_info["proto"]) == socket.IPPROTO_UDP else self.TCP_SYN_SEEN_TIMEOUT),
             }
             self.session_table[key] = sess
+            reverse_key = (
+                str(sess["server_real_ip"]),
+                str(sess["client_src_vip"]),
+                int(sess["proto"]),
+                int(sess["server_port"]),
+                int(sess["client_port"]),
+            )
+            self.session_reverse_index[reverse_key] = key
             self._pin_vip_session(client_vip)
             self._pin_vip_session(dst_vip)
 
