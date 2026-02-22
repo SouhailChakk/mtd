@@ -40,6 +40,8 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     TCP_ESTABLISHED_TIMEOUT = 180
     TCP_CLOSING_TIMEOUT = 8
     UDP_ACTIVE_TIMEOUT = 30
+    VIP_INACTIVITY_RECLAIM = 5
+    VIP_QUARANTINE_SECONDS = 30
     # GRACE VIPs: If idle when moved to GRACE (flow_refs = 0), reclaim immediately (return to pool)
     #             If active when moved to GRACE (flow_refs > 0), keep until flows end
     DISCOVERY_RANGE_LAST_OCTET_MAX = 10
@@ -79,6 +81,8 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         # Activity tracking
         self.vip_flow_refs: Dict[str, int] = {}  # VIP -> Number of installed dataplane flows still alive
         self.vip_session_refs: Dict[str, int] = {}  # VIP -> Active controller-side sessions pinned to VIP
+        self.vip_last_seen: Dict[str, float] = {}  # VIP -> Last observed session activity
+        self.quarantine_until: Dict[str, float] = {}  # VIP -> Earliest timestamp eligible for reuse
 
         # L4 session handling for TCP/UDP NAT consistency
         self.session_table: Dict[Tuple[str, str, int, int, int], Dict[str, object]] = {}
@@ -108,6 +112,14 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         now = time()
         # Proactive host discovery
         self._proactive_discovery(now)
+
+        # Move VIPs from quarantine back to resources when cooldown expires
+        for vip, ready_at in list(self.quarantine_until.items()):
+            if ready_at <= now:
+                self.quarantine_until.pop(vip, None)
+                if vip not in self.Resources:
+                    self.Resources.append(vip)
+                    self.logger.info("QUARANTINE: VIP %s cooldown expired, returned to pool", vip)
         
         # Handle VIPs in GRACE state
         # Use flow_refs to determine activity: if flow_refs > 0, VIP is active; if flow_refs = 0, VIP is idle
@@ -117,21 +129,21 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                 continue
             
             flow_refs = self.vip_flow_refs.get(vip, 0)
-            
             session_refs = self.vip_session_refs.get(vip, 0)
+            last_seen = self.vip_last_seen.get(vip, 0)
+            inactive_for = now - last_seen
 
-            if flow_refs <= 0 and session_refs <= 0:
-                # No active flows = VIP is idle - reclaim immediately (return to pool)
-                self.logger.info("RECLAIM: VIP %s is idle (no active flows), reclaiming immediately", vip)
+            if flow_refs <= 0 and session_refs <= 0 and inactive_for >= self.VIP_INACTIVITY_RECLAIM:
+                self.logger.info("RECLAIM: VIP %s idle for %.1fs, reclaiming", vip, inactive_for)
                 self._delete_flows_by_cookie(vip)
                 self._reclaim_vip(vip)
             else:
-                # VIP has active flows - keep in GRACE until flows end
                 self.logger.debug(
-                    "GRACE: VIP %s still active (%d flow refs, %d session refs), keeping",
+                    "GRACE: VIP %s keep (flow_refs=%d session_refs=%d inactive_for=%.1fs)",
                     vip,
                     flow_refs,
                     session_refs,
+                    inactive_for,
                 )
 
         self._expire_sessions(now)
@@ -256,8 +268,9 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             self.vip_state.get(vip) == self.VIP_STATE_GRACE
             and new_refs == 0
             and self.vip_session_refs.get(vip, 0) == 0
+            and (time() - self.vip_last_seen.get(vip, 0)) >= self.VIP_INACTIVITY_RECLAIM
         ):
-            self.logger.info("FLOW_REMOVED: VIP %s (GRACE) all flows expired, reclaiming immediately", vip)
+            self.logger.info("FLOW_REMOVED: VIP %s (GRACE) now idle, reclaiming", vip)
             self._delete_flows_by_cookie(vip)
             self._reclaim_vip(vip)
 
@@ -267,6 +280,11 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             return self.Resources.pop(0)
         return None
 
+    def _touch_vip(self, vip: str, now: Optional[float] = None):
+        if not vip:
+            return
+        self.vip_last_seen[vip] = now if now is not None else time()
+
     def _bind_primary_vip(self, host_ip: str, vip: str, now: float):
         """Bind a VIP as the primary VIP for a host."""
         self.primary_vip[host_ip] = vip
@@ -274,6 +292,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.vip_state[vip] = self.VIP_STATE_PRIMARY
         self.vip_mac_map[vip] = self._generate_vip_mac(vip)
         self.vip_created_at[vip] = now
+        self._touch_vip(vip, now)
         self.host_vip_pools.setdefault(host_ip, set()).add(vip)
         self.logger.info("BIND: host=%s vip=%s", host_ip, vip)
         # Update DNS mapping file
@@ -309,16 +328,18 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             self._unpin_vip_session(str(sess.get("client_src_vip", "")))
             self._unpin_vip_session(str(sess.get("server_reply_vip", "")))
 
-    def _update_tcp_session_state(self, sess: Dict[str, object], tcp_pkt: Optional[tcp.tcp], now: float):
+    def _update_tcp_session_state(self, sess: Dict[str, object], tcp_pkt: Optional[tcp.tcp], now: float) -> bool:
         if not tcp_pkt:
-            return
+            return False
         bits = int(tcp_pkt.bits)
         syn = bool(bits & tcp.TCP_SYN)
         ack = bool(bits & tcp.TCP_ACK)
         fin = bool(bits & tcp.TCP_FIN)
         rst = bool(bits & tcp.TCP_RST)
 
+        entered_closing = False
         if rst or fin:
+            entered_closing = sess.get("state") != self.SESSION_TCP_CLOSING
             sess["state"] = self.SESSION_TCP_CLOSING
             sess["expires_at"] = now + self.TCP_CLOSING_TIMEOUT
         elif syn and not ack and sess.get("state") != self.SESSION_TCP_ESTABLISHED:
@@ -327,6 +348,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         else:
             sess["state"] = self.SESSION_TCP_ESTABLISHED
             sess["expires_at"] = now + self.TCP_ESTABLISHED_TIMEOUT
+        return entered_closing
 
     def _flow_idle_timeout_for_session(self, sess: Dict[str, object]) -> int:
         proto = int(sess["proto"])
@@ -469,11 +491,21 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             self._pin_vip_session(client_vip)
             self._pin_vip_session(dst_vip)
 
+        self._touch_vip(str(sess.get("client_src_vip", "")), now)
+        self._touch_vip(str(sess.get("server_reply_vip", "")), now)
+
         if int(l4_info["proto"]) == socket.IPPROTO_UDP:
             sess["state"] = self.SESSION_UDP_ACTIVE
             sess["expires_at"] = now + self.UDP_ACTIVE_TIMEOUT
         else:
-            self._update_tcp_session_state(sess, l4_info.get("tcp"), now)
+            entered_closing = self._update_tcp_session_state(sess, l4_info.get("tcp"), now)
+            if entered_closing and not sess.get("flows_deleted"):
+                client_vip = str(sess.get("client_src_vip", ""))
+                server_reply_vip = str(sess.get("server_reply_vip", ""))
+                self._delete_flows_by_cookie(client_vip)
+                if server_reply_vip != client_vip:
+                    self._delete_flows_by_cookie(server_reply_vip)
+                sess["flows_deleted"] = True
 
         if sess.get("server_real_ip") != real_dst:
             sess["server_real_ip"] = real_dst
@@ -519,11 +551,13 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                     flow_refs = self.vip_flow_refs.get(old_vip, 0)
                     session_refs = self.vip_session_refs.get(old_vip, 0)
                     if flow_refs <= 0 and session_refs <= 0:
-                        # No active flows = VIP is idle - reclaim immediately
-                        self.logger.info("ROTATE: host=%s new=%s old=%s -> GRACE (idle, no flows), reclaiming immediately",
-                                         host_ip, new_vip, old_vip)
-                        self._delete_flows_by_cookie(old_vip)
-                        self._reclaim_vip(old_vip)
+                        self.logger.info(
+                            "ROTATE: host=%s new=%s old=%s -> GRACE (idle), reclaim eligible after %ss inactivity",
+                            host_ip,
+                            new_vip,
+                            old_vip,
+                            self.VIP_INACTIVITY_RECLAIM,
+                        )
                     else:
                         # VIP has active sessions/flows - keep in GRACE until both end
                         self.logger.info(
@@ -704,7 +738,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     # ---------------- VIP reclamation ----------------
 
     def _reclaim_vip(self, vip: str):
-        """Reclaim a VIP and return it to the resource pool."""
+        """Reclaim a VIP and move it into quarantine before resource reuse."""
         # Safety check: Never reclaim PRIMARY VIPs - they should only be rotated
         if self.vip_state.get(vip) == self.VIP_STATE_PRIMARY:
             self.logger.warning("RECLAIM: Attempted to reclaim PRIMARY VIP %s - this should not happen! Skipping.", vip)
@@ -722,14 +756,14 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.vip_created_at.pop(vip, None)
         self.vip_flow_refs.pop(vip, None)
         self.vip_session_refs.pop(vip, None)
+        self.vip_last_seen.pop(vip, None)
 
         if self.primary_vip.get(owner) == vip:
             self.primary_vip.pop(owner, None)
 
-        if vip not in self.Resources:
-            self.Resources.append(vip)
+        self.quarantine_until[vip] = time() + self.VIP_QUARANTINE_SECONDS
 
-        self.logger.info("RECLAIM: VIP %s from host %s", vip, owner)
+        self.logger.info("RECLAIM: VIP %s from host %s -> quarantine %ss", vip, owner, self.VIP_QUARANTINE_SECONDS)
         # Update DNS mapping file
         self._update_dns_mapping()
 
