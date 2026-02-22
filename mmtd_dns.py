@@ -121,6 +121,26 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                     self.Resources.append(vip)
                     self.logger.info("QUARANTINE: VIP %s cooldown expired, returned to pool", vip)
         
+        # Fallback for switches that do not reliably emit FlowRemoved on delete-by-cookie.
+        # If we already requested delete and the VIP is GRACE with no controller sessions,
+        # avoid stale flow refs pinning the VIP forever.
+        for vip, delete_ts in list(self.vip_delete_requested_at.items()):
+            if self.vip_state.get(vip) != self.VIP_STATE_GRACE:
+                continue
+            if self.vip_session_refs.get(vip, 0) > 0:
+                continue
+            if self.vip_flow_refs.get(vip, 0) <= 0:
+                self.vip_delete_requested_at.pop(vip, None)
+                continue
+            if (now - delete_ts) >= self.VIP_INACTIVITY_RECLAIM:
+                self.logger.warning(
+                    "FLOW_DELETE_FALLBACK: VIP %s forcing flow refs %d->0 after delete request timeout",
+                    vip,
+                    self.vip_flow_refs.get(vip, 0),
+                )
+                self.vip_flow_refs[vip] = 0
+                self.vip_delete_requested_at.pop(vip, None)
+
         # Handle VIPs in GRACE state
         # Use flow_refs to determine activity: if flow_refs > 0, VIP is active; if flow_refs = 0, VIP is idle
         # IMPORTANT: Only process GRACE VIPs - PRIMARY VIPs should never be reclaimed
@@ -198,6 +218,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         # Full 64-bit mask: 0xFFFF_FFFF_FFFF_FFFF to match both base and VIP IP
         cookie_mask = 0xFFFFFFFFFFFFFFFF
         
+        self.vip_delete_requested_at[vip] = time()
         for dp in list(self.datapaths):
             try:
                 parser = dp.ofproto_parser
@@ -259,7 +280,9 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         old_refs = self.vip_flow_refs.get(vip, 0)
         self.vip_flow_refs[vip] = max(0, old_refs - 1)
         new_refs = self.vip_flow_refs.get(vip, 0)
-        
+        if new_refs <= 0:
+            self.vip_delete_requested_at.pop(vip, None)
+
         self.logger.debug("FLOW_REMOVED: VIP %s flow expired (refs: %d -> %d, state=%s)", 
                          vip, old_refs, new_refs, self.vip_state.get(vip, "UNKNOWN"))
         
