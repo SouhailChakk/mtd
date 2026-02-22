@@ -37,9 +37,9 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     HOUSEKEEPING_INTERVAL = 15
     ROTATE_INTERVAL = 60
     TCP_SYN_SEEN_TIMEOUT = 15
-    TCP_ESTABLISHED_TIMEOUT = 180
+    TCP_ESTABLISHED_TIMEOUT = 15
     TCP_CLOSING_TIMEOUT = 8
-    UDP_ACTIVE_TIMEOUT = 30
+    UDP_ACTIVE_TIMEOUT = 15
     VIP_INACTIVITY_RECLAIM = 5
     VIP_QUARANTINE_SECONDS = 30
     # GRACE VIPs: If idle when moved to GRACE (flow_refs = 0), reclaim immediately (return to pool)
@@ -83,6 +83,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.vip_session_refs: Dict[str, int] = {}  # VIP -> Active controller-side sessions pinned to VIP
         self.vip_last_seen: Dict[str, float] = {}  # VIP -> Last observed session activity
         self.quarantine_until: Dict[str, float] = {}  # VIP -> Earliest timestamp eligible for reuse
+        self.vip_delete_requested_at: Dict[str, float] = {}  # VIP -> Last cookie delete request time
 
         # L4 session handling for TCP/UDP NAT consistency
         self.session_table: Dict[Tuple[str, str, int, int, int], Dict[str, object]] = {}
@@ -139,6 +140,9 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                     self.vip_flow_refs.get(vip, 0),
                 )
                 self.vip_flow_refs[vip] = 0
+                # CRITICAL: Touch VIP when forcing flow_refs to 0 to start inactivity timer
+                # This ensures destination VIP gets reclaimed after 5s inactivity
+                self._touch_vip(vip, now)
                 self.vip_delete_requested_at.pop(vip, None)
 
         # Handle VIPs in GRACE state
@@ -282,6 +286,9 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         new_refs = self.vip_flow_refs.get(vip, 0)
         if new_refs <= 0:
             self.vip_delete_requested_at.pop(vip, None)
+            # CRITICAL: When last flow expires, touch VIP to start inactivity timer
+            # This ensures destination VIP gets reclaimed after 5s inactivity
+            self._touch_vip(vip)
 
         self.logger.debug("FLOW_REMOVED: VIP %s flow expired (refs: %d -> %d, state=%s)", 
                          vip, old_refs, new_refs, self.vip_state.get(vip, "UNKNOWN"))
@@ -525,6 +532,10 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             if entered_closing and not sess.get("flows_deleted"):
                 client_vip = str(sess.get("client_src_vip", ""))
                 server_reply_vip = str(sess.get("server_reply_vip", ""))
+                # CRITICAL: Touch both VIPs BEFORE deleting flows to start inactivity timer
+                # This ensures both VIPs get reclaimed after 5s even if FlowRemoved events are delayed
+                self._touch_vip(client_vip, now)
+                self._touch_vip(server_reply_vip, now)
                 self._delete_flows_by_cookie(client_vip)
                 if server_reply_vip != client_vip:
                     self._delete_flows_by_cookie(server_reply_vip)
@@ -780,6 +791,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.vip_flow_refs.pop(vip, None)
         self.vip_session_refs.pop(vip, None)
         self.vip_last_seen.pop(vip, None)
+        self.vip_delete_requested_at.pop(vip, None)
 
         if self.primary_vip.get(owner) == vip:
             self.primary_vip.pop(owner, None)
