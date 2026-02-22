@@ -51,28 +51,33 @@ class MovingTargetDefense(app_manager.RyuApp):
 
 
         while 1:
-            hub.sleep(1) 
-            self.received_replies = 0
+            hub.sleep(1)
             self.expected_replies = len(self.datapaths)
-            
+
             self.base_packet_counts.clear()
-            for dp in self.datapaths: #code used to active function and ask for flow tables (jordan)
-                self.flow_mode = "packet_count_base"
+            self.base_pending_xids.clear()
+            for dp in self.datapaths:
                 self.logger.info("Base cycle starting")
-                self.active_flows_request(dp)
-            hub.sleep(3) #gives time for replies to come in (jordan)
-            
+                self.base_pending_xids.add(self.active_flows_request(dp))
+            self.wait_for_stats_replies(self.base_pending_xids, 3, "base")
 
             self.delta_packet_counts.clear()
+            self.delta_pending_xids.clear()
             for dp in self.datapaths:
-                self.flow_mode = "packet_count_delta"
                 self.logger.info("Delta cycle starting")
-                self.active_flows_request(dp)
-            hub.sleep(3)
-            
+                self.delta_pending_xids.add(self.active_flows_request(dp))
+            self.wait_for_stats_replies(self.delta_pending_xids, 3, "delta")
+            self.compare_base_and_delta()
 
             self.send_event_to_observers(EventMessage("TIMEOUT"))
             hub.sleep(30) #changes IP every 30 seconds
+
+    def wait_for_stats_replies(self, pending_xids, timeout_seconds, phase_name):
+        start = time()
+        while pending_xids and (time() - start) < timeout_seconds:
+            hub.sleep(0.1)
+        if pending_xids:
+            self.logger.warning("Timed out waiting for %s stats replies; pending xids=%s", phase_name, list(pending_xids))
     
     def __init__(self, *args, **kwargs):
         '''Constructor, used to initialize the member variables'''
@@ -87,7 +92,8 @@ class MovingTargetDefense(app_manager.RyuApp):
         self.delta_packet_counts = {}
         self.active_ips = set()
         self.expected_replies = 0
-        self.received_replies = 0
+        self.base_pending_xids = set()
+        self.delta_pending_xids = set()
         
         self.AuthorizedEntities = ['10.0.0.1']
         self.R2V_Mappings = {
@@ -263,32 +269,31 @@ class MovingTargetDefense(app_manager.RyuApp):
                                                     #OFPG_Any = flows from any port , ofpg= any group, the zeros mean no cookie filtering, match the match filter means match all
     
         datapath.send_msg(req) #now send all that info just created to the switch and the SWITCH shall reply
+        return req.xid
 
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER) #handles the reply from the switch (jordan)
     def flow_reply_handler(self, ev):
-        if self.flow_mode == "packet_count_base":
+        xid = ev.msg.xid
+        if xid in self.base_pending_xids:
             for stat in ev.msg.body:
                 match_flow = stat.match
                 if 'ipv4_src' in match_flow and 'ipv4_dst' in match_flow and 'in_port' in match_flow:
                     flow_id = (match_flow['ipv4_src'], match_flow['ipv4_dst'], match_flow['in_port'])
                     self.base_packet_counts[flow_id] = stat.packet_count
+            self.base_pending_xids.discard(xid)
             self.logger.info("Base Reply proccessed")
-    
-    
-        elif self.flow_mode == "packet_count_delta":
+
+        elif xid in self.delta_pending_xids:
             for stat in ev.msg.body:
                 match_flow = stat.match
                 if 'ipv4_src' in match_flow and 'ipv4_dst' in match_flow and 'in_port' in match_flow:
                     flow_id = (match_flow['ipv4_src'], match_flow['ipv4_dst'], match_flow['in_port'])
                     self.delta_packet_counts[flow_id] = stat.packet_count
-            self.received_replies += 1
-            self.logger.info(f"Delta Reply proccesed ({self.received_replies}/{self.expected_replies})")
-            
-            if self.received_replies == self.expected_replies:
-                self.logger.info("All replies recieved and starting comparison")
-                self.compare_base_and_delta()
-                
-            
+            self.delta_pending_xids.discard(xid)
+            self.logger.info("Delta Reply proccesed")
+        else:
+            self.logger.info("Ignoring flow stats reply with unknown xid=%s", xid)
+
     def compare_base_and_delta(self): #used to compare the two stats pull to find active ips
         from collections import Counter
     
