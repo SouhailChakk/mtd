@@ -816,12 +816,9 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         dst_is_vip = dst_ip in self.vip_owner
         src_is_vip = src_ip in self.vip_owner
 
-        # Real host → Real host must bypass VIP NAT.
-        # If a client opens TCP to a real IP, rewriting replies to come from a VIP
-        # creates peer mismatch (socket bound to real dst gets VIP src in SYN-ACK/data).
+        # Real host → Real host: Translate both to VIPs (when hosts use real IPs directly)
         if src_is_real and dst_is_real:
-            out_port = self.mac_to_port.get(dpid, {}).get(eth.dst, ofp.OFPP_FLOOD)
-            self._forward_packet(msg, dp, in_port, dpid, eth.dst, out_port)
+            self._handle_real_to_real(msg, dp, pkt, ip4, eth, in_port, dpid, src_ip, dst_ip)
             return
 
         # Real host → VIP: SNAT + DNAT (when DNS resolves to VIP)
@@ -911,7 +908,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         ]
 
         forward_l4_match, reverse_l4_match = self._extract_l4_match_fields(pkt, ip4)
-        idle_timeout = self._flow_idle_timeout_for_packet(pkt)
 
         # Protocol-aware match: src=real, dst=real + L4 fields when available
         match = parser.OFPMatch(
@@ -927,7 +923,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         cookie = self._vip_cookie(src_vip)
         # Install flow for subsequent packets
         self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
-                      cookie=cookie, idle_timeout=idle_timeout)
+                      cookie=cookie, idle_timeout=5)
         self.logger.debug("REAL-TO-REAL: Installed forward flow for TCP/UDP: %s -> %s (VIP: %s -> %s)", 
                          src_real, dst_real, src_vip, dst_real)
 
@@ -967,7 +963,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             self.logger.debug("REAL-TO-REAL: Installing reverse flow for dst_vip=%s (cookie=0x%016x) to track flow_refs", 
                              dst_vip, cookie_rev)
             self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
-                          cookie=cookie_rev, idle_timeout=idle_timeout)
+                          cookie=cookie_rev, idle_timeout=5)
 
         self.logger.debug("REAL-TO-REAL: %s -> %s (translated to %s -> %s)", 
                          src_real, dst_real, src_vip, dst_real)
@@ -1018,7 +1014,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         ]
 
         forward_l4_match, reverse_l4_match = self._extract_l4_match_fields(pkt, ip4)
-        idle_timeout = self._flow_idle_timeout_for_packet(pkt)
 
         # Protocol-aware match: src=real, dst=VIP + L4 fields when available
         match = parser.OFPMatch(
@@ -1034,7 +1029,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         cookie = self._vip_cookie(src_vip)
         # Install flow for subsequent packets
         self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
-                      cookie=cookie, idle_timeout=idle_timeout)
+                      cookie=cookie, idle_timeout=5)
         self.logger.debug("REAL-TO-VIP: Installed forward flow for TCP/UDP: %s -> %s (VIP: %s -> %s)", 
                          src_real, dst_vip, src_vip, real_dst)
         
@@ -1072,7 +1067,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             self.logger.debug("REAL-TO-VIP: Installing reverse flow for dst_vip=%s (cookie=0x%016x) to track flow_refs", 
                              dst_vip, cookie_rev)
             self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
-                          cookie=cookie_rev, idle_timeout=idle_timeout)
+                          cookie=cookie_rev, idle_timeout=5)
         
         self.logger.debug("REAL-TO-VIP: %s -> %s (translated to %s -> %s)", 
                          src_real, dst_vip, src_vip, real_dst)
@@ -1102,7 +1097,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         ]
 
         forward_l4_match, _ = self._extract_l4_match_fields(pkt, ip4)
-        idle_timeout = self._flow_idle_timeout_for_packet(pkt)
 
         match = parser.OFPMatch(
             eth_type=0x0800,
@@ -1115,7 +1109,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self._send_packet_out(msg, dp, in_port, actions)
         cookie = self._vip_cookie(src_vip)
         self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
-                      cookie=cookie, idle_timeout=idle_timeout)
+                      cookie=cookie, idle_timeout=5)
         
         self.logger.debug("VIP-TO-REAL: %s (VIP) -> %s", src_vip, dst_real)
 
@@ -1145,7 +1139,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         ]
 
         forward_l4_match, _ = self._extract_l4_match_fields(pkt, ip4)
-        idle_timeout = self._flow_idle_timeout_for_packet(pkt)
 
         match = parser.OFPMatch(
             eth_type=0x0800,
@@ -1158,7 +1151,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self._send_packet_out(msg, dp, in_port, actions)
         cookie = self._vip_cookie(dst_vip)
         self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
-                      cookie=cookie, idle_timeout=idle_timeout)
+                      cookie=cookie, idle_timeout=5)
 
     def _extract_l4_match_fields(self, pkt, ip4):
         """Build protocol-aware OpenFlow match fields for forward and reverse directions."""
@@ -1198,16 +1191,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             )
 
         return ({"ip_proto": ip4.proto}, {"ip_proto": ip4.proto})
-
-    def _flow_idle_timeout_for_packet(self, pkt) -> int:
-        """Fallback idle timeout when packet is not handled by session-tracked L4 flows."""
-        if pkt.get_protocol(tcp.tcp):
-            return self.TCP_ESTABLISHED_TIMEOUT
-        if pkt.get_protocol(udp.udp):
-            return self.UDP_ACTIVE_TIMEOUT
-        if pkt.get_protocol(icmp.icmp):
-            return 15
-        return self.TCP_SYN_SEEN_TIMEOUT
 
     def _ensure_vip_mac(self, vip: str) -> Optional[str]:
         """Return VIP MAC, generating and caching one if missing."""
