@@ -1291,15 +1291,54 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         # Check if this is TCP/UDP - if so, session flows already handle it, don't install duplicate flows
         l4_info = self._extract_l4_info(pkt, ip4)
         if l4_info:
-            # TCP/UDP packet - session flows are already installed by _install_session_flows
-            # Just forward the packet, don't install additional flows
             dst_port = self.mac_to_port.get(dpid, {}).get(dst_real_mac, ofp.OFPP_FLOOD)
             actions = [
                 parser.OFPActionSetField(eth_dst=dst_real_mac),
                 parser.OFPActionOutput(dst_port)
             ]
+
+            # TCP reverse packets are handled by pre-installed session flows.
+            # For UDP, install reverse flow on-demand when packet misses so
+            # the server VIP is marked ACTIVE again after idle expiry.
+            if int(l4_info.get("proto", 0)) == socket.IPPROTO_UDP:
+                client_vip = self.primary_vip.get(dst_real)
+                if client_vip:
+                    udp_match = dict(l4_info.get("forward", {}))
+                    match = parser.OFPMatch(
+                        eth_type=0x0800,
+                        ipv4_src=src_vip,
+                        ipv4_dst=dst_real,
+                        **udp_match,
+                    )
+                    flow_actions = [
+                        parser.OFPActionSetField(ipv4_src=client_vip),
+                        parser.OFPActionSetField(ipv4_dst=dst_real),
+                        parser.OFPActionSetField(eth_dst=dst_real_mac),
+                        parser.OFPActionOutput(dst_port),
+                    ]
+                    self._add_flow(
+                        dp,
+                        priority=self.FLOW_PRIORITY_VIP,
+                        match=match,
+                        actions=flow_actions,
+                        cookie=self._vip_cookie(src_vip),
+                        idle_timeout=self.UDP_ACTIVE_TIMEOUT,
+                    )
+                    self.logger.debug(
+                        "VIP-TO-REAL: Installed UDP reverse flow on-demand src_vip=%s client_vip=%s dst_real=%s",
+                        src_vip,
+                        client_vip,
+                        dst_real,
+                    )
+                else:
+                    self.logger.debug(
+                        "VIP-TO-REAL: UDP reverse miss for %s->%s but no primary VIP found for dst_real",
+                        src_vip,
+                        dst_real,
+                    )
+
             self._send_packet_out(msg, dp, in_port, actions)
-            self.logger.debug("VIP-TO-REAL: TCP/UDP packet, session flows handle it, skipping duplicate flow installation")
+            self.logger.debug("VIP-TO-REAL: L4 packet handled src_vip=%s dst_real=%s proto=%s", src_vip, dst_real, l4_info.get("proto"))
             return
 
         # Only install flows for non-TCP/UDP traffic (e.g., ICMP/ping)
