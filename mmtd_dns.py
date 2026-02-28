@@ -1,17 +1,3 @@
-
-
-"""
-DNS-based Moving Target Defense Ryu controller.
-
-Design:
-- Hosts resolve hostnames to VIPs via DNS (handled by external DNS server)
-- VIPs are assigned to hosts and rotate periodically
-- No SNAT/DNAT - hosts communicate directly using VIPs
-- Simple forwarding rules - VIPs are just regular IPs
-- VIP rotation: DNS TTL expires, clients get new VIP on next lookup
-- Much simpler than SNAT/DNAT approach
-"""
-
 import socket
 from time import time
 from typing import Dict, List, Optional, Set, Tuple
@@ -87,7 +73,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
 
         # L4 session handling for TCP/UDP NAT consistency
         self.session_table: Dict[Tuple[str, str, int, int, int], Dict[str, object]] = {}
-        self.session_reverse_index: Dict[Tuple[str, str, int, int, int], Tuple[str, str, int, int, int]] = {}
         
         # VIP resource pool
         self.Resources: List[str] = self._generate_vips(self.VIP_POOL_START, self.NUM_VIPS)
@@ -269,7 +254,16 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             vip = self._cookie_vip_ip(cookie)
             old_refs = self.vip_flow_refs.get(vip, 0)
             self.vip_flow_refs[vip] = old_refs + 1
-            self.logger.debug("FLOW_ADD: VIP %s flow installed (refs: %d -> %d)", vip, old_refs, old_refs + 1)
+            # DEBUG: log every VIP-related flow installation with match to see where
+            # extra flow_refs for a given VIP (e.g., server VIP) are coming from.
+            self.logger.info(
+                "FLOW_ADD: vip=%s refs=%d->%d idle_timeout=%s match=%s",
+                vip,
+                old_refs,
+                old_refs + 1,
+                idle_timeout,
+                match,
+            )
 
     @set_ev_cls(ofp_event.EventOFPFlowRemoved, MAIN_DISPATCHER)
     def _flow_removed(self, ev):
@@ -347,23 +341,34 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         return (src_ip, dst_vip, proto, src_port, dst_port)
 
     def _expire_sessions(self, now: float):
+        """Expire controller-side sessions.
+
+        IMPORTANT:
+        - TCP sessions: we use a state machine + expires_at to drive session_refs down
+          when the TCP handshake/teardown is done or idle.
+        - UDP sessions: we DO NOT expire based on a fixed controller timer anymore.
+          Instead, we rely on switch flow idle_timeout + FlowRemoved to decide when
+          the VIP is really idle. This prevents GRACE VIPs from being reclaimed
+          mid-UDP stream (e.g., long iperf -u sessions).
+        """
         expired = []
-        for key, sess in self.session_table.items():
+        for key, sess in list(self.session_table.items()):
+            proto = int(sess.get("proto", 0))
+
+            # For UDP, never expire purely on controller timer; let flows/FlowRemoved
+            # drive vip_flow_refs and thus VIP reclaim.
+            if proto == socket.IPPROTO_UDP:
+                continue
+
             expires_at = sess.get("expires_at", 0)
             if expires_at <= now:
                 expired.append(key)
+
         for key in expired:
             sess = self.session_table.pop(key, None)
             if not sess:
                 continue
-            reverse_key = (
-                str(sess.get("server_real_ip", "")),
-                str(sess.get("client_src_vip", "")),
-                int(sess.get("proto", 0)),
-                int(sess.get("server_port", 0)),
-                int(sess.get("client_port", 0)),
-            )
-            self.session_reverse_index.pop(reverse_key, None)
+            # Only TCP sessions reach here; unpin both VIPs so GRACE reclaim can happen
             self._unpin_vip_session(str(sess.get("client_src_vip", "")))
             self._unpin_vip_session(str(sess.get("server_reply_vip", "")))
 
@@ -424,6 +429,73 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         return None
 
     def _install_session_flows(self, msg, dp, parser, in_port, l4_info, sess, src_real_mac, dst_real_mac):
+        """Install per-session flows for TCP/UDP.
+
+        DEBUG: We deliberately log when flows are installed so we can see
+        exactly which VIPs (client_vip / server_reply_vip) get flow_refs
+        increments, and how many flows are created per session.
+        """
+        # CRITICAL: Prevent duplicate flow installation for the same session
+        # Without this guard, every packet in a TCP/UDP stream would re-install
+        # the same flows, causing vip_flow_refs to inflate (e.g., 0->1->2->3->...->9)
+        # for a single session, preventing VIPs from being reclaimed.
+        #
+        # IMPORTANT: If flows expired (flow_refs == 0), the session is dead.
+        # For UDP: remove the session from table (like TCP expiration)
+        # For TCP: flows are managed by state machine, session_refs keeps VIP active
+        if sess.get("flows_installed"):
+            client_vip = str(sess.get("client_src_vip", ""))
+            server_reply_vip = str(sess.get("server_reply_vip", ""))
+            client_flow_refs = self.vip_flow_refs.get(client_vip, 0)
+            server_flow_refs = self.vip_flow_refs.get(server_reply_vip, 0)
+            proto = int(sess.get("proto", 0))
+            
+            # If flows expired (flow_refs == 0), session is dead
+            if client_flow_refs == 0 and server_flow_refs == 0:
+                if proto == socket.IPPROTO_UDP:
+                    # For UDP: remove dead session from table (like TCP expiration)
+                    # This allows VIPs to be reclaimed and new sessions to be created
+                    self.logger.debug(
+                        "SESSION_DEAD: UDP session flows expired (client_vip=%s refs=%d, server_vip=%s refs=%d), removing dead session",
+                        client_vip, client_flow_refs, server_reply_vip, server_flow_refs
+                    )
+                    # Remove session from table - this will allow new session creation
+                    key = self._session_key(
+                        sess.get("client_real_ip"),
+                        sess.get("server_vip"),
+                        proto,
+                        sess.get("client_port"),
+                        sess.get("server_port")
+                    )
+                    self.session_table.pop(key, None)
+                    # Unpin VIPs if they were pinned
+                    self._unpin_vip_session(client_vip)
+                    self._unpin_vip_session(server_reply_vip)
+                    # Return False to indicate session was removed, caller should create new session
+                    return False
+                else:
+                    # TCP: flows managed by state machine, session_refs keeps VIP active
+                    # Don't remove session, just skip installation
+                    self.logger.debug(
+                        "SESSION_FLOW_SKIP: TCP flows expired but session_refs keeps VIP active "
+                        "(client_ip=%s server_vip=%s)",
+                        sess.get("client_real_ip"),
+                        sess.get("server_vip"),
+                    )
+                    return True
+            elif client_flow_refs > 0 or server_flow_refs > 0:
+                # Flows still active, skip installation
+                self.logger.debug(
+                    "SESSION_FLOW_SKIP: flows already installed for session "
+                    "(client_ip=%s server_vip=%s proto=%s src_port=%s dst_port=%s)",
+                    sess.get("client_real_ip"),
+                    sess.get("server_vip"),
+                    l4_info.get("proto"),
+                    l4_info.get("src_port"),
+                    l4_info.get("dst_port"),
+                )
+                return True
+        
         ofp = dp.ofproto
         client_ip = str(sess["client_real_ip"])
         server_vip = str(sess["server_vip"])
@@ -441,6 +513,16 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         src_port = self.mac_to_port.get(dp.id, {}).get(src_real_mac, ofp.OFPP_FLOOD)
 
         idle_timeout = self._flow_idle_timeout_for_session(sess)
+        # DEBUG: per-session forward flow for client VIP
+        self.logger.info(
+            "SESSION_FLOW_ADD_FWD: client_vip=%s server_vip=%s server_reply_vip=%s idle_timeout=%s match_src=%s match_dst=%s",
+            client_vip,
+            server_vip,
+            server_reply_vip,
+            idle_timeout,
+            client_ip,
+            server_vip,
+        )
         actions_fwd = [
             parser.OFPActionSetField(ipv4_src=client_vip),
             parser.OFPActionSetField(ipv4_dst=server_real),
@@ -479,6 +561,16 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             ipv4_dst=client_vip,
             **l4_info["reverse"],
         )
+        # DEBUG: per-session reverse flow for server VIP (server_reply_vip)
+        self.logger.info(
+            "SESSION_FLOW_ADD_REV: client_vip=%s server_vip=%s server_reply_vip=%s idle_timeout=%s match_src=%s match_dst=%s",
+            client_vip,
+            server_vip,
+            server_reply_vip,
+            idle_timeout,
+            server_real,
+            client_vip,
+        )
         self._add_flow(
             dp,
             priority=self.FLOW_PRIORITY_VIP,
@@ -487,6 +579,8 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             cookie=self._vip_cookie(server_reply_vip),
             idle_timeout=idle_timeout,
         )
+        # Mark flows as installed to prevent duplicate installation on subsequent packets
+        sess["flows_installed"] = True
         return True
 
     def _handle_l4_session(self, msg, dp, pkt, in_port, src_real, dst_vip) -> bool:
@@ -510,23 +604,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         now = time()
         key = self._session_key(src_real, dst_vip, int(l4_info["proto"]), int(l4_info["src_port"]), int(l4_info["dst_port"]))
         sess = self.session_table.get(key)
-
         if not sess:
-            reverse_key = (src_real, dst_vip, int(l4_info["proto"]), int(l4_info["src_port"]), int(l4_info["dst_port"]))
-            canonical_key = self.session_reverse_index.get(reverse_key)
-            if canonical_key:
-                key = canonical_key
-                sess = self.session_table.get(canonical_key)
-
-        if not sess:
-            tcp_pkt = l4_info.get("tcp")
-            # Only allow TCP session creation on an opening SYN (not SYN-ACK/ACK).
-            # This avoids creating ghost sessions from reverse-direction packets.
-            if tcp_pkt:
-                bits = int(tcp_pkt.bits)
-                if not (bits & tcp.TCP_SYN) or (bits & tcp.TCP_ACK):
-                    return False
-
             client_vip = self._deterministic_client_vip(src_real)
             if not client_vip:
                 return False
@@ -543,16 +621,14 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                 "expires_at": now + (self.UDP_ACTIVE_TIMEOUT if int(l4_info["proto"]) == socket.IPPROTO_UDP else self.TCP_SYN_SEEN_TIMEOUT),
             }
             self.session_table[key] = sess
-            reverse_key = (
-                str(sess["server_real_ip"]),
-                str(sess["client_src_vip"]),
-                int(sess["proto"]),
-                int(sess["server_port"]),
-                int(sess["client_port"]),
-            )
-            self.session_reverse_index[reverse_key] = key
-            self._pin_vip_session(client_vip)
-            self._pin_vip_session(dst_vip)
+            # IMPORTANT:
+            # - For TCP we pin VIP sessions so GRACE VIPs are not reclaimed mid-handshake/teardown.
+            # - For UDP we DO NOT pin VIP sessions; we rely solely on dataplane flows (vip_flow_refs)
+            #   to decide when a VIP is active/idle. This avoids GRACE/IDLE VIPs sticking forever
+            #   after UDP traffic, since flows will naturally expire via idle_timeout.
+            if int(l4_info["proto"]) != socket.IPPROTO_UDP:
+                self._pin_vip_session(client_vip)
+                self._pin_vip_session(dst_vip)
 
         self._touch_vip(str(sess.get("client_src_vip", "")), now)
         self._touch_vip(str(sess.get("server_reply_vip", "")), now)
@@ -577,7 +653,17 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         if sess.get("server_real_ip") != real_dst:
             sess["server_real_ip"] = real_dst
 
-        return self._install_session_flows(msg, dp, parser, in_port, l4_info, sess, src_real_mac, dst_real_mac)
+        # Install flows - if session was removed (dead UDP session), create new one
+        result = self._install_session_flows(msg, dp, parser, in_port, l4_info, sess, src_real_mac, dst_real_mac)
+        if not result:
+            # Session was removed (dead UDP session with expired flows)
+            # Create a new session by calling _handle_l4_session recursively
+            # But first, clear the session from table if it still exists
+            key = self._session_key(src_real, dst_vip, int(l4_info["proto"]), int(l4_info["src_port"]), int(l4_info["dst_port"]))
+            self.session_table.pop(key, None)
+            # Recursively call to create new session
+            return self._handle_l4_session(msg, dp, pkt, in_port, src_real, dst_vip)
+        return result
 
     # ---------------- switch bringup ----------------
 
@@ -1022,7 +1108,9 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
 
         # Send first packet immediately (critical for TCP SYN)
         self._send_packet_out(msg, dp, in_port, actions)
-        cookie = self._vip_cookie(src_vip)
+        # ICMP error messages should not count toward VIP activity (flow_refs)
+        # They're transient error responses, not actual session traffic
+        cookie = 0 if self._is_icmp_error(pkt) else self._vip_cookie(src_vip)
         # Install flow for subsequent packets
         self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
                       cookie=cookie, idle_timeout=5)
@@ -1061,7 +1149,8 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                 **reverse_l4_match,
             )
             # Reverse flow translates source to dst_vip, so use dst_vip cookie to track flow_refs
-            cookie_rev = self._vip_cookie(dst_vip)
+            # ICMP error messages should not count toward VIP activity (flow_refs)
+            cookie_rev = 0 if self._is_icmp_error(pkt) else self._vip_cookie(dst_vip)
             self.logger.debug("REAL-TO-REAL: Installing reverse flow for dst_vip=%s (cookie=0x%016x) to track flow_refs", 
                              dst_vip, cookie_rev)
             self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
@@ -1101,9 +1190,14 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             self._forward_packet(msg, dp, in_port, dpid, eth.dst, ofp.OFPP_FLOOD)
             return
 
+        # Try to handle as L4 session first (TCP/UDP)
+        # If it's TCP/UDP, _handle_l4_session will install session flows and return True
+        # For non-TCP/UDP (e.g., ICMP), it returns False and we continue to install generic flows
         if self._handle_l4_session(msg, dp, pkt, in_port, src_real, dst_vip):
             return
 
+        # Only install flows for non-TCP/UDP traffic (e.g., ICMP/ping)
+        # TCP/UDP flows are handled by _install_session_flows above
         dst_port = self.mac_to_port.get(dpid, {}).get(dst_real_mac, ofp.OFPP_FLOOD)
         
         # SNAT + DNAT: real → VIP (both directions)
@@ -1128,7 +1222,9 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         
         # Send first packet immediately (critical for TCP SYN)
         self._send_packet_out(msg, dp, in_port, actions)
-        cookie = self._vip_cookie(src_vip)
+        # ICMP error messages should not count toward VIP activity (flow_refs)
+        # They're transient error responses, not actual session traffic
+        cookie = 0 if self._is_icmp_error(pkt) else self._vip_cookie(src_vip)
         # Install flow for subsequent packets
         self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
                       cookie=cookie, idle_timeout=5)
@@ -1165,7 +1261,8 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                 **reverse_l4_match,
             )
             # Reverse flow translates source to dst_vip, so use dst_vip cookie to track flow_refs
-            cookie_rev = self._vip_cookie(dst_vip)
+            # ICMP error messages should not count toward VIP activity (flow_refs)
+            cookie_rev = 0 if self._is_icmp_error(pkt) else self._vip_cookie(dst_vip)
             self.logger.debug("REAL-TO-VIP: Installing reverse flow for dst_vip=%s (cookie=0x%016x) to track flow_refs", 
                              dst_vip, cookie_rev)
             self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match_rev, actions=actions_rev,
@@ -1191,7 +1288,22 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             self._forward_packet(msg, dp, in_port, dpid, eth.dst, ofp.OFPP_FLOOD)
             return
 
-        # Reverse SNAT: VIP → real
+        # Check if this is TCP/UDP - if so, session flows already handle it, don't install duplicate flows
+        l4_info = self._extract_l4_info(pkt, ip4)
+        if l4_info:
+            # TCP/UDP packet - session flows are already installed by _install_session_flows
+            # Just forward the packet, don't install additional flows
+            dst_port = self.mac_to_port.get(dpid, {}).get(dst_real_mac, ofp.OFPP_FLOOD)
+            actions = [
+                parser.OFPActionSetField(eth_dst=dst_real_mac),
+                parser.OFPActionOutput(dst_port)
+            ]
+            self._send_packet_out(msg, dp, in_port, actions)
+            self.logger.debug("VIP-TO-REAL: TCP/UDP packet, session flows handle it, skipping duplicate flow installation")
+            return
+
+        # Only install flows for non-TCP/UDP traffic (e.g., ICMP/ping)
+        # TCP/UDP flows are handled by _install_session_flows
         dst_port = self.mac_to_port.get(dpid, {}).get(dst_real_mac, ofp.OFPP_FLOOD)
         actions = [
             parser.OFPActionSetField(eth_dst=dst_real_mac),
@@ -1209,7 +1321,9 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         )
         
         self._send_packet_out(msg, dp, in_port, actions)
-        cookie = self._vip_cookie(src_vip)
+        # ICMP error messages should not count toward VIP activity (flow_refs)
+        # They're transient error responses, not actual session traffic
+        cookie = 0 if self._is_icmp_error(pkt) else self._vip_cookie(src_vip)
         self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
                       cookie=cookie, idle_timeout=5)
         
@@ -1251,9 +1365,21 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         )
         
         self._send_packet_out(msg, dp, in_port, actions)
-        cookie = self._vip_cookie(dst_vip)
+        # ICMP error messages should not count toward VIP activity (flow_refs)
+        # They're transient error responses, not actual session traffic
+        cookie = 0 if self._is_icmp_error(pkt) else self._vip_cookie(dst_vip)
         self._add_flow(dp, priority=self.FLOW_PRIORITY_VIP, match=match, actions=actions,
                       cookie=cookie, idle_timeout=5)
+
+    def _is_icmp_error(self, pkt) -> bool:
+        """Check if ICMP packet is an error message (not echo request/reply)."""
+        icmp_pkt = pkt.get_protocol(icmp.icmp)
+        if not icmp_pkt:
+            return False
+        # ICMP error messages: Destination Unreachable (3), Time Exceeded (11), 
+        # Parameter Problem (12), Source Quench (4 - deprecated)
+        # Echo Request (8) and Echo Reply (0) are NOT errors
+        return icmp_pkt.type not in (icmp.ICMP_ECHO_REQUEST, icmp.ICMP_ECHO_REPLY)
 
     def _extract_l4_match_fields(self, pkt, ip4):
         """Build protocol-aware OpenFlow match fields for forward and reverse directions."""
