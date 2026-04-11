@@ -811,7 +811,30 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     # ---------------- rotation ----------------
 
     def _rotation_loop(self):
+        wait_logged_at = 0.0
+        rotation_armed = False
         while True:
+            discovered = len(self.detected_hosts)
+            expected = self._N_HOSTS
+            if discovered < expected:
+                now = time()
+                # Avoid log spam while waiting for large topologies to finish discovery.
+                if (now - wait_logged_at) >= 30:
+                    self.logger.info(
+                        "ROTATE_WAIT: holding VIP rotation until host discovery completes (%d/%d discovered)",
+                        discovered, expected
+                    )
+                    wait_logged_at = now
+                hub.sleep(2)
+                continue
+
+            if not rotation_armed:
+                rotation_armed = True
+                self.logger.info(
+                    "ROTATE_READY: host discovery complete (%d/%d). Starting rotation timer (%ss).",
+                    discovered, expected, self.ROTATE_INTERVAL
+                )
+
             self.logger.debug("ROTATE: sleeping for %ss before next primary VIP rotation", self.ROTATE_INTERVAL)
             hub.sleep(self.ROTATE_INTERVAL)
             now = time()
