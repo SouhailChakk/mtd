@@ -37,7 +37,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     _TOPO_CFG = {
         'small':  ('10.0.1.1',  13, 24,  16),
         'medium': ('10.0.1.1',  11, 20, 108),
-        'large':  ('10.0.2.1',  23, 44, 504),
+        'large':  ('10.0.2.1',  23, 44, 503),
     }
     _tc = _TOPO_CFG.get(_TOPO, _TOPO_CFG['small'])
     VIP_POOL_START          = _tc[0]
@@ -48,13 +48,13 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
 
     # Discovery range derived from host count
     # small/medium: all hosts in 10.0.0.x  (max_o2=0, max_o3=n_hosts)
-    # large:        hosts span 10.0.0.1-254 and 10.0.1.1-250
+    # large:        hosts span 10.0.0.1-254 and 10.0.1.1-249
     _HOST_MAX_O2 = (_N_HOSTS - 1) // 254
     _HOST_MAX_O3 = ((_N_HOSTS - 1) % 254) + 1
     DISCOVERY_RANGE_LAST_OCTET_MAX = 254  # kept for compat
 
     # VIP pool: 3 VIPs/host * n_hosts + quarantine buffer
-    # large: 504*3 + 1000 headroom = ~2500 min; use 6000 for safety
+    # large: 503*3 + 1000 headroom = ~2500 min; use 6000 for safety
     NUM_VIPS = 6000
 
     FLOW_PRIORITY_VIP = 100
@@ -896,7 +896,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
 
         # Only learn hosts in discovery range
         # small/medium: 10.0.0.1 - 10.0.0.N
-        # large:        10.0.0.1 - 10.0.0.254 and 10.0.1.1 - 10.0.1.250
+        # large:        10.0.0.1 - 10.0.0.254 and 10.0.1.1 - 10.0.1.249
         # Never learn the controller probe address (10.0.0.254 / CONTROLLER_DISCOVERY_MAC)
         if real_ip == '10.0.0.254':
             return

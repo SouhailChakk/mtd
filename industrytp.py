@@ -7,7 +7,7 @@
 # Switch port sizes:
 #   4-port  -> small  topology (~16  hosts, 13 switches)
 #   24-port -> medium topology (~108 hosts, 11 switches)
-#   48-port -> large  topology (~504 hosts, 23 switches)
+#   48-port -> large  topology (~503 hosts, 23 switches)
 #
 # Architecture: 3-tier (Core -> Aggregation -> Edge -> Hosts)
 #   Edge switches : ports//2 downlinks to hosts, ports//2 uplinks to agg
@@ -24,7 +24,7 @@
 # Usage:
 #   sudo python industrytp.py 4     # 4-port  switches (~16  hosts)
 #   sudo python industrytp.py 24    # 24-port switches (~108 hosts)
-#   sudo python industrytp.py 48    # 48-port switches (~504 hosts)
+#   sudo python industrytp.py 48    # 48-port switches (~503 hosts)
 # =============================================================================
 
 from mininet.topo import Topo
@@ -52,7 +52,7 @@ SWITCH_CONFIGS = {
 TARGET_HOSTS = {
     4:  16,
     24: 108,
-    48: 504,
+    48: 503,
 }
 
 
@@ -209,7 +209,7 @@ if __name__ == '__main__':
         print('Examples:')
         print('  sudo python industrytp.py 4    # 4-port  switches (~16  hosts)')
         print('  sudo python industrytp.py 24   # 24-port switches (~108 hosts)')
-        print('  sudo python industrytp.py 48   # 48-port switches (~504 hosts)')
+        print('  sudo python industrytp.py 48   # 48-port switches (~503 hosts)')
         sys.exit(1)
 
     try:
