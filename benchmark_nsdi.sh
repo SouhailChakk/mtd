@@ -242,6 +242,31 @@ print(m.get('$real_ip', ''))
     echo "$real_ip"
 }
 
+VIP_LOOKUP_HELPER="/tmp/cpam_vip_lookup.py"
+ensure_vip_lookup_helper() {
+    cat > "$VIP_LOOKUP_HELPER" <<'PY'
+#!/usr/bin/env python3
+import json
+import sys
+
+if len(sys.argv) < 2:
+    print("")
+    raise SystemExit(0)
+
+real_ip = sys.argv[1]
+mapping_file = sys.argv[2] if len(sys.argv) > 2 else "/tmp/mtd_vip_mapping.json"
+
+try:
+    with open(mapping_file, "r", encoding="utf-8") as f:
+        mapping = json.load(f)
+except Exception:
+    mapping = {}
+
+print(mapping.get(real_ip, real_ip))
+PY
+    chmod +x "$VIP_LOOKUP_HELPER" 2>/dev/null || true
+}
+
 echo "[INIT] Loading VIP mappings from $VIP_MAPPING ..."
 for hname in "${!HOST_IPS[@]}"; do
     real="${HOST_IPS[$hname]}"
@@ -563,6 +588,7 @@ cat "${OUTDIR}/A_latency_summary.txt"
 log_step "[2+N1+N3] Model 2 — Connection Churn (${CHURN_DUR}s, ${CHURN_CONNS} conns/pair)"
 
 refresh_vips
+ensure_vip_lookup_helper
 stop_all_iperf
 dump_ovs "pre_churn"
 
@@ -599,10 +625,11 @@ sleep 1
 CHURN_PIDS=()
 for i in $(seq 0 $((NUM_PAIRS - 1))); do
     src="${PAIRS_SRC[$i]}"
-    dst_ip="${HOST_VIPS[${PAIRS_DST[$i]}]:-${HOST_IPS[${PAIRS_DST[$i]}]}}"   # connect to VIP
+    dst_real="${HOST_IPS[${PAIRS_DST[$i]}]}"
     mnexec -a "${HOST_PIDS[$src]}" bash -lc "
         for j in \$(seq 1 ${CHURN_CONNS}); do
-            iperf -c ${dst_ip} -t ${CHURN_CONN_DUR} 2>/dev/null || true
+            dst_ip=\$(python3 ${VIP_LOOKUP_HELPER} ${dst_real} ${VIP_MAPPING} 2>/dev/null || echo ${dst_real})
+            iperf -c \${dst_ip} -t ${CHURN_CONN_DUR} 2>/dev/null || true
         done
     " > "${OUTDIR}/churn_client_${src}.txt" 2>&1 &
     CHURN_PIDS+=("$!")
