@@ -37,7 +37,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     _TOPO_CFG = {
         'small':  ('10.0.1.1',  13, 24,  16),
         'medium': ('10.0.1.1',  11, 20, 108),
-        'large':  ('10.0.2.1',  23, 44, 504),
+        'large':  ('10.0.2.1',  23, 44, 503),
     }
     _tc = _TOPO_CFG.get(_TOPO, _TOPO_CFG['small'])
     VIP_POOL_START          = _tc[0]
@@ -48,13 +48,13 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
 
     # Discovery range derived from host count
     # small/medium: all hosts in 10.0.0.x  (max_o2=0, max_o3=n_hosts)
-    # large:        hosts span 10.0.0.1-254 and 10.0.1.1-250
+    # large:        hosts span 10.0.0.1-254 and 10.0.1.1-249
     _HOST_MAX_O2 = (_N_HOSTS - 1) // 254
     _HOST_MAX_O3 = ((_N_HOSTS - 1) % 254) + 1
     DISCOVERY_RANGE_LAST_OCTET_MAX = 254  # kept for compat
 
     # VIP pool: 3 VIPs/host * n_hosts + quarantine buffer
-    # large: 504*3 + 1000 headroom = ~2500 min; use 6000 for safety
+    # large: 503*3 + 1000 headroom = ~2500 min; use 6000 for safety
     NUM_VIPS = 6000
 
     FLOW_PRIORITY_VIP = 100
@@ -811,7 +811,30 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     # ---------------- rotation ----------------
 
     def _rotation_loop(self):
+        wait_logged_at = 0.0
+        rotation_armed = False
         while True:
+            discovered = len(self.detected_hosts)
+            expected = self._N_HOSTS
+            if discovered < expected:
+                now = time()
+                # Avoid log spam while waiting for large topologies to finish discovery.
+                if (now - wait_logged_at) >= 30:
+                    self.logger.info(
+                        "ROTATE_WAIT: holding VIP rotation until host discovery completes (%d/%d discovered)",
+                        discovered, expected
+                    )
+                    wait_logged_at = now
+                hub.sleep(2)
+                continue
+
+            if not rotation_armed:
+                rotation_armed = True
+                self.logger.info(
+                    "ROTATE_READY: host discovery complete (%d/%d). Starting rotation timer (%ss).",
+                    discovered, expected, self.ROTATE_INTERVAL
+                )
+
             self.logger.debug("ROTATE: sleeping for %ss before next primary VIP rotation", self.ROTATE_INTERVAL)
             hub.sleep(self.ROTATE_INTERVAL)
             now = time()
@@ -873,7 +896,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
 
         # Only learn hosts in discovery range
         # small/medium: 10.0.0.1 - 10.0.0.N
-        # large:        10.0.0.1 - 10.0.0.254 and 10.0.1.1 - 10.0.1.250
+        # large:        10.0.0.1 - 10.0.0.254 and 10.0.1.1 - 10.0.1.249
         # Never learn the controller probe address (10.0.0.254 / CONTROLLER_DISCOVERY_MAC)
         if real_ip == '10.0.0.254':
             return
