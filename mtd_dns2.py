@@ -35,23 +35,17 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     import os as _os
     _TOPO = _os.environ.get('MTD_TOPO', 'small')
     _TOPO_CFG = {
-        'small':  ('10.0.1.1',  13, 24,  16),
-        'medium': ('10.0.1.1',  11, 20, 108),
-        'large':  ('10.0.2.1',  23, 44, 503),
+        'small':  ('10.0.1.1', 13, 24, 0, 16),
+        'medium': ('10.0.1.1', 11, 20, 0, 108),
+        'large':  ('10.0.2.1', 23, 44, 1, 250),
     }
     _tc = _TOPO_CFG.get(_TOPO, _TOPO_CFG['small'])
-    VIP_POOL_START          = _tc[0]
-    EXPECTED_SWITCHES       = _tc[1]
+    VIP_POOL_START = _tc[0]
+    EXPECTED_SWITCHES = _tc[1]
     EXPECTED_DIRECTED_LINKS = _tc[2]
-    _N_HOSTS                = _tc[3]
+    _HOST_O2_MAX = _tc[3]
+    _HOST_O3_MAX = _tc[4]
     EXPECTED_HOSTS = 0
-
-    # Discovery range derived from host count
-    # small/medium: all hosts in 10.0.0.x  (max_o2=0, max_o3=n_hosts)
-    # large:        hosts span 10.0.0.1-254 and 10.0.1.1-249
-    _HOST_MAX_O2 = (_N_HOSTS - 1) // 254
-    _HOST_MAX_O3 = ((_N_HOSTS - 1) % 254) + 1
-    DISCOVERY_RANGE_LAST_OCTET_MAX = 254  # kept for compat
 
     # VIP pool: 3 VIPs/host * n_hosts + quarantine buffer
     # large: 503*3 + 1000 headroom = ~2500 min; use 6000 for safety
@@ -815,7 +809,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         rotation_armed = False
         while True:
             discovered = len(self.detected_hosts)
-            expected = self._N_HOSTS
+            expected = (self._HOST_O2_MAX * 254 + self._HOST_O3_MAX)
             if discovered < expected:
                 now = time()
                 # Avoid log spam while waiting for large topologies to finish discovery.
@@ -907,9 +901,9 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             o2, o3 = int(parts[2]), int(parts[3])
             if o3 < 1 or o2 < 0:
                 return
-            if o2 > self._HOST_MAX_O2:
+            if o2 > self._HOST_O2_MAX:
                 return
-            if o2 == self._HOST_MAX_O2 and o3 > self._HOST_MAX_O3:
+            if o2 == self._HOST_O2_MAX and o3 > self._HOST_O3_MAX:
                 return
         except Exception:
             return
@@ -965,15 +959,15 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             self._last_discovery = {}
 
         # Stop probing once all expected hosts are discovered
-        if len(self.detected_hosts) >= self._N_HOSTS:
+        if len(self.detected_hosts) >= (self._HOST_O2_MAX * 254 + self._HOST_O3_MAX):
             return
 
         # Build list of all expected host IPs
         _all_host_ips = []
-        for _o2 in range(self._HOST_MAX_O2 + 1):
-            _o3_max = self._HOST_MAX_O3 if _o2 == self._HOST_MAX_O2 else 254
+        for _o2 in range(self._HOST_O2_MAX + 1):
+            _o3_max = self._HOST_O3_MAX if _o2 == self._HOST_O2_MAX else 254
             for _o3 in range(1, _o3_max + 1):
-                _all_host_ips.append(f'10.0.{_o2}.{_o3}')
+                _all_host_ips.append('10.0.%d.%d' % (_o2, _o3))
 
         # Only probe undiscovered hosts, max 10 per cycle to avoid flooding
         _undiscovered = [ip for ip in _all_host_ips if ip not in self.detected_hosts]
