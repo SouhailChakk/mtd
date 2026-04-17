@@ -32,8 +32,8 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     VIP_QUARANTINE_SECONDS = 30
     # GRACE VIPs: If idle when moved to GRACE (flow_refs = 0), reclaim immediately (return to pool)
     #             If active when moved to GRACE (flow_refs > 0), keep until flows end
-    DISCOVERY_RANGE_LAST_OCTET_MAX = 10
-    VIP_POOL_START = "10.0.0.11"
+    DISCOVERY_MAX_HOSTS = 512
+    VIP_POOL_START = "10.0.3.1"
 
     FLOW_PRIORITY_VIP = 100
     COOKIE_BASE = 0xA000_0000_0000_0000
@@ -60,7 +60,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.datapaths: Set["ryu.controller.controller.Datapath"] = set()
         
         # Host discovery and mapping
-        self.detected_hosts: Set[str] = set()  # Set of discovered real host IPs (10.0.0.1-10.0.0.10)
+        self.detected_hosts: Set[str] = set()  # Set of discovered real host IPs (10.0.x.y host plan)
         self.host_ip_to_mac: Dict[str, str] = {}  # Real host IP -> MAC address
         
         # VIP assignment and state
@@ -219,6 +219,27 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     def _ip_to_int(self, ip: str) -> int:
         p = ip.split('.')
         return (int(p[0]) << 24) + (int(p[1]) << 16) + (int(p[2]) << 8) + int(p[3])
+
+    def _host_id_to_ip(self, host_id: int) -> str:
+        """Map Mininet host index (h1..hN) to 10.0.x.y, matching industry topology."""
+        o2 = (host_id - 1) // 254
+        o3 = ((host_id - 1) % 254) + 1
+        return f"10.0.{o2}.{o3}"
+
+    def _is_discovery_host_ip(self, ip: str) -> bool:
+        """Return True for real host IPs in the industry topology address plan."""
+        try:
+            o1, o2, o3, o4 = [int(x) for x in ip.split(".")]
+        except Exception:
+            return False
+        if o1 != 10 or o2 != 0:
+            return False
+        if o3 < 0:
+            return False
+        if o4 < 1 or o4 > 254:
+            return False
+        host_id = (o3 * 254) + o4
+        return 1 <= host_id <= self.DISCOVERY_MAX_HOSTS
 
     def _vip_cookie(self, vip: str) -> int:
         return self.COOKIE_BASE | (self._ip_to_int(vip) & self.COOKIE_VIP_MASK)
@@ -854,14 +875,13 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         if not real_ip:
             return
 
-        # Only learn hosts in discovery range
-        try:
-            if not real_ip.startswith("10.0.0."):
-                return
-            last = int(real_ip.split(".")[-1])
-            if last < 1 or last > self.DISCOVERY_RANGE_LAST_OCTET_MAX:
-                return
-        except Exception:
+        # Only learn real hosts from the expected industry topology addressing plan.
+        # Keep controller/VIP/session behavior untouched by filtering with host MAC scheme.
+        if not self._is_discovery_host_ip(real_ip):
+            return
+        if not mac or mac.lower() == self.CONTROLLER_DISCOVERY_MAC.lower():
+            return
+        if not mac.lower().startswith("00:00:00:00:"):
             return
 
         # Update host info
@@ -914,8 +934,8 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         if not hasattr(self, '_last_discovery'):
             self._last_discovery = {}
 
-        for last_octet in range(1, self.DISCOVERY_RANGE_LAST_OCTET_MAX + 1):
-            target_ip = f"10.0.0.{last_octet}"
+        for host_id in range(1, self.DISCOVERY_MAX_HOSTS + 1):
+            target_ip = self._host_id_to_ip(host_id)
 
             if target_ip in self.detected_hosts:
                 continue
