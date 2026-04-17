@@ -1,0 +1,19 @@
+=== [N1] Flow Setup Rate (RFC 8456 §5.2.1) ===
+Topology   : Large (~500 hosts, 48-port switches)
+Method     : Connection churn — each reconnect = 1 new OVS flow
+Pairs      : 252
+Conns/pair : 20 x 1s
+
+Flows before churn : 23
+Flows at mid-churn : 7335  (peak)
+Flows after churn  : 11101
+New flows at peak  : 7312
+Elapsed (half)     : 13.571s
+
+FSR (overall)      : 538.79 flows/sec
+
+INTERPRETATION:
+  FSR = rate at which the controller installs new forwarding rules.
+  Under MTD, each VIP rotation adds extra PacketIn load on top of
+  baseline FSR. Compare small/medium/large to show how FSR scales.
+  Sub-linear growth = controller is the bottleneck, not the hosts.
