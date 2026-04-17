@@ -1,0 +1,65 @@
+╔══════════════════════════════════════════════════════════════════╗
+║         CPAM MTD NSDI Benchmark v3 — Master Summary              ║
+╠══════════════════════════════════════════════════════════════════╣
+║  Label      : baseline_large
+║  Topology   : Large (~500 hosts, 48-port switches)
+║  Timestamp  : 20260416_231338
+║  Hosts      : 504   Pairs: 252
+║  Duration   : 120s QoS / 240s long TCP / 20s churn
+║  Ryu log    : /var/log/ryu.log
+╠══════════════════════════════════════════════════════════════════╣
+║  FILE INDEX
+╠══════════════════════════════════════════════════════════════════╣
+║  [1]    Topology Discovery (§5.1.1)  : 1_topology_discovery_time.txt
+║  [2]    Async Msg Rate    (§5.1.3)   : 2_async_rate_summary.txt
+║  [3+N2] RPPT + Percentiles(§5.1.4)  : 3_rppt_summary.txt
+║  [4]    Forwarding Table  (§5.2.3)   : 4_forwarding_table_capacity.txt
+║  [5]    NRT               (§5.4.2)   : 5_nrt_timing.txt
+║  [A]    ICMP Latency                 : A_latency_summary.txt
+║  [B]    TCP Throughput               : B_tcp_client_*.txt
+║  [C]    TCP Session Continuity       : C_session_continuity_summary.txt
+║  [D+E]  UDP Jitter + Loss            : DE_udp_summary.txt
+║  [F]    Controller CPU + Memory      : F_controller_overhead_summary.txt
+║  [N1]   Flow Setup Rate              : N1_flow_setup_rate.txt
+║  [N3]   RPPT Under Churn Load        : N3_rppt_under_load.txt
+║  [N4]   VIP Reclamation Lag          : N4_vip_reclamation_lag.txt
+║  [N5]   Scalability Snapshot         : N5_scalability_snapshot.txt
+╠══════════════════════════════════════════════════════════════════╣
+║  QUICK RESULTS
+╠══════════════════════════════════════════════════════════════════╣
+║  TOPOLOGY: Large (~500 hosts, 48-port switches)
+║    Hosts=504  Pairs=252
+║
+║  LATENCY:
+║    Topology mean RTT : 13.503 ms  (across 252 pairs)
+║
+║  TCP SESSION CONTINUITY:
+║    Survival rate    : 100.0%
+║    RESULT: PASS — all sessions survived VIP rotations
+║
+║  RPPT IDLE (p50/p95/p99):
+║
+║  RPPT UNDER CHURN LOAD (p50/p95/p99):
+║
+║  FLOW SETUP RATE:
+║    FSR (overall)      : 538.79 flows/sec
+║
+║  VIP RECLAMATION LAG (p99):
+║
+║  CONTROLLER OVERHEAD:
+║      Average CPU : 0.23%
+║      Average RSS : 69546 kB
+╠══════════════════════════════════════════════════════════════════╣
+║  10-RUN LOOP COMMAND (RFC 8456 §4.7)                             ║
+║                                                                  ║
+║  for TOPO in small medium large; do                              ║
+║    for i in {1..10}; do                                         ║
+║      sudo ./benchmark_nsdi.sh 120 mtd_${TOPO}_iter${i} \      ║
+║           /var/log/ryu.log ${TOPO}                          ║
+║    done                                                          ║
+║  done                                                            ║
+║                                                                  ║
+║  CONTROLLER LOG TOKENS REQUIRED:                                 ║
+║    RPPT_MEASURED: key=(...) elapsed_ms=X.XXX   -> N2, N3        ║
+║    VIP_RECLAIMED: vip=X.X.X.X lived_ms=X.XXX  -> N4            ║
+╚══════════════════════════════════════════════════════════════════╝
