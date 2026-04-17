@@ -1,0 +1,11 @@
+=== RFC 8456 §5.4.2 Network Re-provisioning Time ===
+Topology    : Large (~500 hosts, 48-port switches)
+Leaf switch : edge1
+Spine switch: agg1
+
+link_failure_time=2026-04-16T23:26:41,393869046-07:00
+failed_port=edge1:xid=0x5
+link_restore_time=2026-04-16T23:26:56,508324263-07:00
+
+=== VIP Rotation Events During NRT Window ===
+No rotation events found in log
