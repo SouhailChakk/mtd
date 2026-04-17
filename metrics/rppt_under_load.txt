@@ -1,0 +1,9 @@
+=== [N3] RPPT Under Concurrent Load ===
+Topology : Large (~500 hosts, 48-port switches)
+Window   : Connection churn phase (20s)
+
+RPPT events during churn: 0
+0
+
+No RPPT events captured during churn.
+Ensure controller logs: RPPT_MEASURED: key=(...) elapsed_ms=X.XXX
