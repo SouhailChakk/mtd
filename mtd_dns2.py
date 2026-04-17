@@ -21,6 +21,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
     _EVENTS = [EventMessage]
 
+    NUM_VIPS = 6000
     HOUSEKEEPING_INTERVAL = 15
     ROTATE_INTERVAL = 60
     TCP_SYN_SEEN_TIMEOUT = 15
@@ -31,37 +32,18 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     VIP_QUARANTINE_SECONDS = 30
     # GRACE VIPs: If idle when moved to GRACE (flow_refs = 0), reclaim immediately (return to pool)
     #             If active when moved to GRACE (flow_refs > 0), keep until flows end
-    # MTD_TOPO env var: small | medium | large  (default: small)
-    import os as _os
-    _TOPO = _os.environ.get('MTD_TOPO', 'small')
-    _TOPO_CFG = {
-        # (vip_pool_start, expected_switches, expected_directed_links, host_o2_max, host_o3_max)
-        # Counts align with industrytp.py fat-tree generator:
-        #   small  (4-port):  14 switches,  50 directed switch links,  16 hosts
-        #   medium (24-port): 21 switches, 112 directed switch links, 108 hosts
-        #   large  (48-port): 28 switches, 140 directed switch links, 512 hosts
-        'small':  ('10.0.1.1', 14, 50, 0, 16),
-        'medium': ('10.0.1.1', 21, 112, 0, 108),
-        'large':  ('10.0.3.1', 28, 140, 2, 4),
-    }
-    _tc = _TOPO_CFG.get(_TOPO, _TOPO_CFG['small'])
-    VIP_POOL_START = _tc[0]
-    EXPECTED_SWITCHES = _tc[1]
-    EXPECTED_DIRECTED_LINKS = _tc[2]
-    _HOST_O2_MAX = _tc[3]
-    _HOST_O3_MAX = _tc[4]
-    EXPECTED_HOSTS = (_tc[3] * 254 + _tc[4])
-
-    # VIP pool: 3 VIPs/host * n_hosts + quarantine buffer
-    # large: 503*3 + 1000 headroom = ~2500 min; use 6000 for safety
-    NUM_VIPS = 6000
+    DISCOVERY_RANGE_LAST_OCTET_MAX = 10
+    VIP_POOL_START = "10.0.0.11"
 
     FLOW_PRIORITY_VIP = 100
     COOKIE_BASE = 0xA000_0000_0000_0000
     COOKIE_VIP_MASK = 0xFFFF_FFFF
     CONTROLLER_DISCOVERY_MAC = "02:00:00:00:00:fe"
-    DISCOVERY_PROBES_PER_CYCLE = 1024
-    DISCOVERY_RETRY_SECONDS = 5
+
+    # Topology discovery: switches + links only (hosts excluded for fair benchmark)
+    EXPECTED_SWITCHES = 2
+    EXPECTED_DIRECTED_LINKS = 2
+    EXPECTED_HOSTS = 0  # 0 = do not wait for host discovery
 
     VIP_STATE_PRIMARY = "PRIMARY"
     VIP_STATE_GRACE = "GRACE"
@@ -812,30 +794,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     # ---------------- rotation ----------------
 
     def _rotation_loop(self):
-        wait_logged_at = 0.0
-        rotation_armed = False
         while True:
-            discovered = len(self.detected_hosts)
-            expected = (self._HOST_O2_MAX * 254 + self._HOST_O3_MAX)
-            if discovered < expected:
-                now = time()
-                # Avoid log spam while waiting for large topologies to finish discovery.
-                if (now - wait_logged_at) >= 30:
-                    self.logger.info(
-                        "ROTATE_WAIT: holding VIP rotation until host discovery completes (%d/%d discovered)",
-                        discovered, expected
-                    )
-                    wait_logged_at = now
-                hub.sleep(2)
-                continue
-
-            if not rotation_armed:
-                rotation_armed = True
-                self.logger.info(
-                    "ROTATE_READY: host discovery complete (%d/%d). Starting rotation timer (%ss).",
-                    discovered, expected, self.ROTATE_INTERVAL
-                )
-
             self.logger.debug("ROTATE: sleeping for %ss before next primary VIP rotation", self.ROTATE_INTERVAL)
             hub.sleep(self.ROTATE_INTERVAL)
             now = time()
@@ -896,21 +855,11 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             return
 
         # Only learn hosts in discovery range
-        # small/medium: 10.0.0.1 - 10.0.0.N
-        # large:        10.0.0.1 - 10.0.0.254 and 10.0.1.1 - 10.0.1.249
-        # Never learn the controller probe address (10.0.0.254 / CONTROLLER_DISCOVERY_MAC)
-        if real_ip == '10.0.0.254':
-            return
         try:
-            parts = real_ip.split('.')
-            if len(parts) != 4 or parts[0] != '10' or parts[1] != '0':
+            if not real_ip.startswith("10.0.0."):
                 return
-            o2, o3 = int(parts[2]), int(parts[3])
-            if o3 < 1 or o2 < 0:
-                return
-            if o2 > self._HOST_O2_MAX:
-                return
-            if o2 == self._HOST_O2_MAX and o3 > self._HOST_O3_MAX:
+            last = int(real_ip.split(".")[-1])
+            if last < 1 or last > self.DISCOVERY_RANGE_LAST_OCTET_MAX:
                 return
         except Exception:
             return
@@ -965,40 +914,19 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         if not hasattr(self, '_last_discovery'):
             self._last_discovery = {}
 
-        # Stop probing once all expected hosts are discovered
-        if len(self.detected_hosts) >= (self._HOST_O2_MAX * 254 + self._HOST_O3_MAX):
-            return
-
-        # Build list of all expected host IPs
-        _all_host_ips = []
-        for _o2 in range(self._HOST_O2_MAX + 1):
-            _o3_max = self._HOST_O3_MAX if _o2 == self._HOST_O2_MAX else 254
-            for _o3 in range(1, _o3_max + 1):
-                _all_host_ips.append('10.0.%d.%d' % (_o2, _o3))
-
-        # Probe undiscovered hosts aggressively so large topologies converge fast.
-        # The previous conservative cap/retry (50 probes, 60s retry) could take
-        # minutes to discover all hosts in 500+ host topologies.
-        _undiscovered = [ip for ip in _all_host_ips if ip not in self.detected_hosts]
-        _to_probe = _undiscovered[:self.DISCOVERY_PROBES_PER_CYCLE]
-
-        for target_ip in _to_probe:
+        for last_octet in range(1, self.DISCOVERY_RANGE_LAST_OCTET_MAX + 1):
+            target_ip = f"10.0.0.{last_octet}"
 
             if target_ip in self.detected_hosts:
                 continue
 
             if target_ip in self._last_discovery:
-                if now - self._last_discovery[target_ip] < self.DISCOVERY_RETRY_SECONDS:
+                if now - self._last_discovery[target_ip] < 60:
                     continue
 
             self._last_discovery[target_ip] = now
 
-            # Send ARP from ONE switch only — OVS flooding propagates it
-            # Sending from all switches floods the control plane at scale
-            _dp = next(iter(self.datapaths), None)
-            if _dp is None:
-                continue
-            for dp in [_dp]:
+            for dp in list(self.datapaths):
                 try:
                     parser = dp.ofproto_parser
                     ofp = dp.ofproto
@@ -1107,6 +1035,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.vip_created_at.pop(vip, None)
         self.vip_flow_refs.pop(vip, None)
         self.vip_session_refs.pop(vip, None)
+        self.vip_last_seen.pop(vip, None)
         self.vip_delete_requested_at.pop(vip, None)
 
         if self.primary_vip.get(owner) == vip:
@@ -1114,9 +1043,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
 
         self.quarantine_until[vip] = time() + self.VIP_QUARANTINE_SECONDS
 
-        _last_seen = self.vip_last_seen.pop(vip, None)
-        _lived_ms = (time() - _last_seen) * 1000 if _last_seen else 0.0
-        self.logger.info("VIP_RECLAIMED: vip=%s lived_ms=%.3f", vip, _lived_ms)
         self.logger.info("RECLAIM: VIP %s from host %s -> quarantine %ss", vip, owner, self.VIP_QUARANTINE_SECONDS)
         # Update DNS mapping file
         self._update_dns_mapping()
