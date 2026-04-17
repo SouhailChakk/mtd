@@ -35,9 +35,14 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     import os as _os
     _TOPO = _os.environ.get('MTD_TOPO', 'small')
     _TOPO_CFG = {
-        'small':  ('10.0.1.1', 13, 24, 0, 16),
-        'medium': ('10.0.1.1', 11, 20, 0, 108),
-        'large':  ('10.0.2.1', 23, 44, 1, 250),
+        # (vip_pool_start, expected_switches, expected_directed_links, host_o2_max, host_o3_max)
+        # Counts align with industrytp.py fat-tree generator:
+        #   small  (4-port):  14 switches,  50 directed switch links,  16 hosts
+        #   medium (24-port): 21 switches, 112 directed switch links, 108 hosts
+        #   large  (48-port): 28 switches, 140 directed switch links, 512 hosts
+        'small':  ('10.0.1.1', 14, 50, 0, 16),
+        'medium': ('10.0.1.1', 21, 112, 0, 108),
+        'large':  ('10.0.3.1', 28, 140, 2, 4),
     }
     _tc = _TOPO_CFG.get(_TOPO, _TOPO_CFG['small'])
     VIP_POOL_START = _tc[0]
@@ -45,7 +50,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     EXPECTED_DIRECTED_LINKS = _tc[2]
     _HOST_O2_MAX = _tc[3]
     _HOST_O3_MAX = _tc[4]
-    EXPECTED_HOSTS = 0
+    EXPECTED_HOSTS = (_tc[3] * 254 + _tc[4])
 
     # VIP pool: 3 VIPs/host * n_hosts + quarantine buffer
     # large: 503*3 + 1000 headroom = ~2500 min; use 6000 for safety
@@ -55,6 +60,8 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     COOKIE_BASE = 0xA000_0000_0000_0000
     COOKIE_VIP_MASK = 0xFFFF_FFFF
     CONTROLLER_DISCOVERY_MAC = "02:00:00:00:00:fe"
+    DISCOVERY_PROBES_PER_CYCLE = 1024
+    DISCOVERY_RETRY_SECONDS = 5
 
     VIP_STATE_PRIMARY = "PRIMARY"
     VIP_STATE_GRACE = "GRACE"
@@ -969,9 +976,11 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
             for _o3 in range(1, _o3_max + 1):
                 _all_host_ips.append('10.0.%d.%d' % (_o2, _o3))
 
-        # Only probe undiscovered hosts, max 10 per cycle to avoid flooding
+        # Probe undiscovered hosts aggressively so large topologies converge fast.
+        # The previous conservative cap/retry (50 probes, 60s retry) could take
+        # minutes to discover all hosts in 500+ host topologies.
         _undiscovered = [ip for ip in _all_host_ips if ip not in self.detected_hosts]
-        _to_probe = _undiscovered[:50]  # 50 probes/cycle, one switch each = safe rate
+        _to_probe = _undiscovered[:self.DISCOVERY_PROBES_PER_CYCLE]
 
         for target_ip in _to_probe:
 
@@ -979,7 +988,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                 continue
 
             if target_ip in self._last_discovery:
-                if now - self._last_discovery[target_ip] < 60:
+                if now - self._last_discovery[target_ip] < self.DISCOVERY_RETRY_SECONDS:
                     continue
 
             self._last_discovery[target_ip] = now
