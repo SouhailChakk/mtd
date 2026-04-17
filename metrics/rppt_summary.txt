@@ -1,0 +1,12 @@
+=== RFC 8456 §5.1.4 + [N2] RPPT Idle + Percentiles ===
+Topology : Large (~500 hosts, 48-port switches)
+Source   : Ryu log (/var/log/ryu.log)
+
+Idle RPPT = events before churn window started (lines 74-74)
+Churn RPPT is isolated in N3_rppt_under_load.txt
+
+Idle RPPT events: 0
+0
+
+No idle RPPT events found.
+Ensure controller logs: RPPT_MEASURED: key=(...) elapsed_ms=X.XXX
