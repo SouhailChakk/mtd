@@ -1,0 +1,34 @@
+=== [N5] Scalability Snapshot ===
+Topology   : Large (~500 hosts, 48-port switches)
+Hosts      : 504
+Pairs      : 252
+Timestamp  : 2026-04-16T23:29:39,512388902-07:00
+
+Flow table peak    : 11117 entries
+Flow table final   : 25 entries
+
+FSR (overall)      : 538.79 flows/sec
+
+RPPT idle (p50 / p95 / p99):
+  see 3_rppt_summary.txt
+
+RPPT under churn load (p50 / p95 / p99):
+  see N3_rppt_under_load.txt
+
+Session continuity: Survival rate    : 100.0%
+Session continuity: RESULT: PASS — all sessions survived VIP rotations
+
+Controller:   Average CPU : 0.23%
+Controller:   Average RSS : 69546 kB
+
+────────────────────────────────────────────────────────
+CROSS-TOPOLOGY COMPARISON (run for all three, then compare):
+
+  Metric              small  medium  large  -> Expected trend
+  FSR (flows/sec)     ?      ?       ?      -> sub-linear growth
+  RPPT p99 (ms)       ?      ?       ?      -> should stay bounded
+  Peak flow table     ?      ?       ?      -> linear with hosts
+  Session survival    ?      ?       ?      -> 100% at all scales
+  Controller CPU      ?      ?       ?      -> no spike at large
+
+Replace ? with values from each topology's N5_scalability_snapshot.txt
