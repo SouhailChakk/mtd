@@ -1,0 +1,14 @@
+=== RFC 8456 §5.1.3 Async Message Processing Rate ===
+Topology : Large (~500 hosts, 48-port switches)
+Method   : Connection churn (Model 2)
+
+Estimated PacketIn events : ~5040
+Observed elapsed          : 27.142s
+Estimated event rate      : ~185.6 events/sec
+
+RPPT events logged during churn: 0
+0
+(see N3 for percentile breakdown)
+
+Controller saturation warnings : 0
+0
