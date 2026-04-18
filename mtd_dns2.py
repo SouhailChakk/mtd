@@ -541,9 +541,9 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         # IMPORTANT: Once flows are installed, never reinstall them (for both TCP and UDP).
         # If flows expire (flow_refs == 0), the session is still active (session_refs > 0 for pinned sessions).
         # For both TCP and UDP: session_refs keeps VIP active even if flows expire
-        if sess.get("flows_installed"):
+        if sess.get("flows_installed") or sess.get("flow_install_in_progress"):
             self.logger.debug(
-                "SESSION_FLOW_SKIP: flows already installed for session "
+                "SESSION_FLOW_SKIP: flows already installed/in-progress for session "
                 "(client_ip=%s server_vip=%s proto=%s src_port=%s dst_port=%s)",
                 sess.get("client_real_ip"),
                 sess.get("server_vip"),
@@ -552,6 +552,10 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                 l4_info.get("dst_port"),
             )
             return True
+
+        # Guard against back-to-back PacketIn events for the same session arriving
+        # before the first FlowMod batch is fully processed.
+        sess["flow_install_in_progress"] = True
 
         # RPPT: use PacketIn start time so we measure PacketIn -> last FlowMod (same scope as baseline)
         if rppt_start is None:
@@ -567,6 +571,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         dst_vip_mac = self._ensure_vip_mac(server_reply_vip)
         if not src_vip_mac or not dst_vip_mac:
             self.logger.warning("SESSION: Missing VIP MAC(s) for %s -> %s", client_vip, server_reply_vip)
+            sess.pop("flow_install_in_progress", None)
             return False
 
         dst_port = self.mac_to_port.get(dp.id, {}).get(dst_real_mac, ofp.OFPP_FLOOD)
@@ -645,6 +650,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.logger.info("RPPT_MEASURED: key=%s elapsed_ms=%.3f", rppt_key, elapsed_ms)
         # Mark flows as installed to prevent duplicate installation on subsequent packets
         sess["flows_installed"] = True
+        sess.pop("flow_install_in_progress", None)
         return True
 
     def _handle_l4_session(self, msg, dp, pkt, in_port, src_real, dst_vip, rppt_start=None) -> bool:
