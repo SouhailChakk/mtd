@@ -32,13 +32,18 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     VIP_QUARANTINE_SECONDS = 30
     # GRACE VIPs: If idle when moved to GRACE (flow_refs = 0), reclaim immediately (return to pool)
     #             If active when moved to GRACE (flow_refs > 0), keep until flows end
-    DISCOVERY_RANGE_LAST_OCTET_MAX = 10
-    VIP_POOL_START = "10.0.0.11"
+    REAL_HOST_POOL_SIZE = 512
+    VIP_POOL_START = "10.0.2.1"
+    HOST_SUBNET_NETWORK_INT = (10 << 24)  # 10.0.0.0
+    HOST_SUBNET_PREFIX = 22
+    HOST_SUBNET_SIZE = 1 << (32 - HOST_SUBNET_PREFIX)
+    HOST_SUBNET_BROADCAST_INT = HOST_SUBNET_NETWORK_INT + HOST_SUBNET_SIZE - 1
 
     FLOW_PRIORITY_VIP = 100
     COOKIE_BASE = 0xA000_0000_0000_0000
     COOKIE_VIP_MASK = 0xFFFF_FFFF
     CONTROLLER_DISCOVERY_MAC = "02:00:00:00:00:fe"
+    CONTROLLER_DISCOVERY_IP = "10.0.0.254"
 
     # Topology discovery: switches + links only (hosts excluded for fair benchmark)
     EXPECTED_SWITCHES = 2
@@ -60,7 +65,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.datapaths: Set["ryu.controller.controller.Datapath"] = set()
         
         # Host discovery and mapping
-        self.detected_hosts: Set[str] = set()  # Set of discovered real host IPs (10.0.0.1-10.0.0.10)
+        self.detected_hosts: Set[str] = set()  # Set of discovered real host IPs in first REAL_HOST_POOL_SIZE addresses
         self.host_ip_to_mac: Dict[str, str] = {}  # Real host IP -> MAC address
         
         # VIP assignment and state
@@ -195,15 +200,17 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     # ---------------- utils ----------------
 
     def _generate_vips(self, start_ip: str, count: int) -> List[str]:
-        base = list(map(int, start_ip.split('.')))
         out: List[str] = []
-        for _ in range(count):
-            out.append('.'.join(map(str, base)))
-            base[3] += 1
-            for i in (3, 2, 1):
-                if base[i] > 255:
-                    base[i] = 0
-                    base[i - 1] += 1
+        current = self._ip_to_int(start_ip)
+        while len(out) < count and current < self.HOST_SUBNET_BROADCAST_INT:
+            if self.HOST_SUBNET_NETWORK_INT < current < self.HOST_SUBNET_BROADCAST_INT:
+                out.append(self._int_to_ip(current))
+            current += 1
+        if len(out) < count:
+            self.logger.warning(
+                "VIP_POOL: Requested %d VIPs from %s but only %d usable addresses fit in 10.0.0.0/%d",
+                count, start_ip, len(out), self.HOST_SUBNET_PREFIX
+            )
         return out
 
     def _generate_vip_mac(self, vip_ip: str) -> str:
@@ -219,6 +226,30 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     def _ip_to_int(self, ip: str) -> int:
         p = ip.split('.')
         return (int(p[0]) << 24) + (int(p[1]) << 16) + (int(p[2]) << 8) + int(p[3])
+
+    def _int_to_ip(self, ip_int: int) -> str:
+        return ".".join([
+            str((ip_int >> 24) & 0xFF),
+            str((ip_int >> 16) & 0xFF),
+            str((ip_int >> 8) & 0xFF),
+            str(ip_int & 0xFF),
+        ])
+
+    def _host_ip_from_index(self, host_index: int) -> str:
+        max_usable = self.HOST_SUBNET_SIZE - 2
+        if host_index < 1 or host_index > max_usable:
+            raise ValueError("host_index must be in [1, %d]" % max_usable)
+        return self._int_to_ip(self.HOST_SUBNET_NETWORK_INT + host_index)
+
+    def _is_real_host_pool_ip(self, ip: str) -> bool:
+        try:
+            ip_int = self._ip_to_int(ip)
+        except Exception:
+            return False
+        if not (self.HOST_SUBNET_NETWORK_INT < ip_int < self.HOST_SUBNET_BROADCAST_INT):
+            return False
+        max_real_ip = self.HOST_SUBNET_NETWORK_INT + self.REAL_HOST_POOL_SIZE
+        return self.HOST_SUBNET_NETWORK_INT < ip_int <= max_real_ip
 
     def _vip_cookie(self, vip: str) -> int:
         return self.COOKIE_BASE | (self._ip_to_int(vip) & self.COOKIE_VIP_MASK)
@@ -854,14 +885,8 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         if not real_ip:
             return
 
-        # Only learn hosts in discovery range
-        try:
-            if not real_ip.startswith("10.0.0."):
-                return
-            last = int(real_ip.split(".")[-1])
-            if last < 1 or last > self.DISCOVERY_RANGE_LAST_OCTET_MAX:
-                return
-        except Exception:
+        # Only learn hosts from first 512 usable IPs in 10.0.0.0/22
+        if not self._is_real_host_pool_ip(real_ip):
             return
 
         # Update host info
@@ -914,8 +939,8 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         if not hasattr(self, '_last_discovery'):
             self._last_discovery = {}
 
-        for last_octet in range(1, self.DISCOVERY_RANGE_LAST_OCTET_MAX + 1):
-            target_ip = f"10.0.0.{last_octet}"
+        for host_index in range(1, self.REAL_HOST_POOL_SIZE + 1):
+            target_ip = self._host_ip_from_index(host_index)
 
             if target_ip in self.detected_hosts:
                 continue
@@ -939,7 +964,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                     p.add_protocol(arp.arp(
                         opcode=arp.ARP_REQUEST,
                         src_mac=self.CONTROLLER_DISCOVERY_MAC,
-                        src_ip='10.0.0.254',
+                        src_ip=self.CONTROLLER_DISCOVERY_IP,
                         dst_mac='00:00:00:00:00:00',
                         dst_ip=target_ip
                     ))
