@@ -39,6 +39,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     COOKIE_BASE = 0xA000_0000_0000_0000
     COOKIE_VIP_MASK = 0xFFFF_FFFF
     CONTROLLER_DISCOVERY_MAC = "02:00:00:00:00:fe"
+    CONTROLLER_DISCOVERY_IP = "10.0.0.254"
 
     # Topology discovery: switches + links only (hosts excluded for fair benchmark)
     EXPECTED_SWITCHES = 2
