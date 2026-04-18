@@ -100,6 +100,27 @@ def host_ip_from_index(host_index):
     )
 
 
+def host_ip_from_index(host_index):
+    """
+    Return the Nth real host IP in 10.0.0.0/8 (1-based).
+    Uses full octet progression, e.g.:
+      1   -> 10.0.0.1
+      255 -> 10.0.0.255
+      256 -> 10.0.1.0
+      512 -> 10.0.2.0
+    """
+    if host_index < 1:
+        raise ValueError('host_index must be >= 1')
+    base_int = (10 << 24)
+    ip_int = base_int + host_index
+    return '%d.%d.%d.%d' % (
+        (ip_int >> 24) & 0xFF,
+        (ip_int >> 16) & 0xFF,
+        (ip_int >> 8) & 0xFF,
+        ip_int & 0xFF,
+    )
+
+
 class FatTreeTopo(Topo):
     """
     Enterprise fat-tree topology with full redundancy.
@@ -185,7 +206,7 @@ class FatTreeTopo(Topo):
 
             # Connect hosts to this edge switch
             for h in range(hosts_per_edge):
-                ip  = '%s/%d' % (host_ip_from_index(host_id), HOST_SUBNET_PREFIX)
+                ip  = '%s/8' % host_ip_from_index(host_id)
                 mac = '00:00:00:00:%02x:%02x' % (
                     host_id // 256,
                     host_id % 256
