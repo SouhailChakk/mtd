@@ -25,10 +25,9 @@
 #   medium (k=24) : pending
 #   large  (k=8)  : 4 core, 8 agg, 16 edge,  ~512  hosts  (uses k=8 fat-tree)
 #
-# Host IP addressing (same as original — compatible with mtd_dns2.py):
-#   h1-h254   -> 10.0.0.1  - 10.0.0.254
-#   h255-h508 -> 10.0.1.1  - 10.0.1.254  etc.
-#   All hosts use /8 subnet so VIPs in 10.0.x.x are reachable
+# Host IP addressing:
+#   Hosts use sequential usable addresses inside 10.0.0.0/22
+#   (single flat subnet across 10.0.0.x ... 10.0.3.x)
 #
 # Usage:
 #   sudo python industrytp.py 4     # small  (~16  hosts)
@@ -73,6 +72,32 @@ FAT_TREE_CONFIGS = {
     24: {'n_core': 4, 'n_agg': 8,  'n_edge': 9,  'hosts_per_edge': 12, 'uplinks': 2},
     48: {'n_core': 4, 'n_agg': 8,  'n_edge': 16, 'hosts_per_edge': 32, 'uplinks': 2},
 }
+
+HOST_SUBNET_PREFIX = 22
+HOST_SUBNET_NETWORK_INT = (10 << 24)  # 10.0.0.0
+HOST_SUBNET_SIZE = 1 << (32 - HOST_SUBNET_PREFIX)
+HOST_SUBNET_BROADCAST_INT = HOST_SUBNET_NETWORK_INT + HOST_SUBNET_SIZE - 1
+HOST_SUBNET_USABLE = HOST_SUBNET_SIZE - 2
+
+
+def host_ip_from_index(host_index):
+    """
+    Return the Nth usable host IP in 10.0.0.0/22 (1-based).
+    Uses full sequential progression, e.g.:
+      1   -> 10.0.0.1
+      255 -> 10.0.0.255
+      256 -> 10.0.1.0
+      512 -> 10.0.2.0
+    """
+    if host_index < 1 or host_index > HOST_SUBNET_USABLE:
+        raise ValueError('host_index must be in [1, %d]' % HOST_SUBNET_USABLE)
+    ip_int = HOST_SUBNET_NETWORK_INT + host_index
+    return '%d.%d.%d.%d' % (
+        (ip_int >> 24) & 0xFF,
+        (ip_int >> 16) & 0xFF,
+        (ip_int >> 8) & 0xFF,
+        ip_int & 0xFF,
+    )
 
 
 def host_ip_from_index(host_index):
@@ -124,6 +149,12 @@ class FatTreeTopo(Topo):
         n_edge         = cfg['n_edge']
         hosts_per_edge = cfg['hosts_per_edge']
         uplinks        = cfg['uplinks']
+        required_hosts = n_edge * hosts_per_edge
+        if required_hosts > HOST_SUBNET_USABLE:
+            raise ValueError(
+                'Topology needs %d hosts but subnet 10.0.0.0/%d supports only %d usable hosts'
+                % (required_hosts, HOST_SUBNET_PREFIX, HOST_SUBNET_USABLE)
+            )
 
         # ── Core switches ─────────────────────────────────────────────────────
         # All core switches are interconnected with each other for redundancy
@@ -237,7 +268,7 @@ def run(port_count):
     print('')
     _vip_start = host_ip_from_index(topo.n_hosts + 1)
     print('  VIPs start at  : %s' % _vip_start)
-    print('  Subnet         : 10.0.0.0/8  (hosts + VIPs across octets)')
+    print('  Subnet         : 10.0.0.0/%d  (single flat subnet)' % HOST_SUBNET_PREFIX)
     print('=' * 62)
     print('')
 
