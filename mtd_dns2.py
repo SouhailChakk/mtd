@@ -955,7 +955,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                     p.add_protocol(arp.arp(
                         opcode=arp.ARP_REQUEST,
                         src_mac=self.CONTROLLER_DISCOVERY_MAC,
-                        src_ip=self.CONTROLLER_DISCOVERY_IP,
+                        src_ip='10.255.255.254',
                         dst_mac='00:00:00:00:00:00',
                         dst_ip=target_ip
                     ))
