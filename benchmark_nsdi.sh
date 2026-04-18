@@ -434,7 +434,7 @@ preflight_controller_tokens() {
     stop_all_iperf
 
     pre_lines="$(tail -n +$((pre_start + 1)) "$RYU_LOG" 2>/dev/null || true)"
-    if echo "$pre_lines" | grep -q 'TOPO_DISCOVERY_COMPLETE' || grep -q 'TOPO_DISCOVERY_COMPLETE' "$RYU_LOG" 2>/dev/null; then
+    if echo "$pre_lines" | grep -q 'TOPO_DISCOVERY_COMPLETE'; then
         echo "[PREFLIGHT] OK: TOPO_DISCOVERY_COMPLETE"
     else
         echo "[PREFLIGHT][ERROR] Missing TOPO_DISCOVERY_COMPLETE"
