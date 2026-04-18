@@ -221,6 +221,7 @@ else
     echo "  (pair list suppressed for $TOPOLOGY — $NUM_PAIRS total pairs)"
 fi
 echo ""
+preflight_controller_tokens
 
 # ── Look up current primary VIPs from controller mapping file ─────────────────
 # The controller writes /tmp/mtd_vip_mapping.json: {"real_ip": "vip", ...}
@@ -404,6 +405,61 @@ extract_rppt_values() {
     echo "$lines" | grep -oP 'elapsed_ms=\K[0-9.]+' > "$outfile" || true
 }
 
+preflight_controller_tokens() {
+    # Warm-up probe to catch missing instrumentation before long test phases.
+    if [[ -z "$RYU_LOG" || ! -f "$RYU_LOG" ]]; then
+        echo "[PREFLIGHT] Skipping token preflight (Ryu log unavailable)"
+        return 0
+    fi
+    if [[ "$NUM_PAIRS" -lt 1 ]]; then
+        echo "[PREFLIGHT] Skipping token preflight (no host pairs)"
+        return 0
+    fi
+
+    echo "[PREFLIGHT] Verifying controller log tokens..."
+    local pre_start src dst dst_ip pre_lines preflight_ok
+    preflight_ok=1
+    pre_start="$(wc -l < "$RYU_LOG" | tr -d ' \n')"
+    src="${PAIRS_SRC[0]}"
+    dst="${PAIRS_DST[0]}"
+    dst_ip="${HOST_VIPS[$dst]:-${HOST_IPS[$dst]}}"
+
+    # Trigger L4 path once so RPPT logging is exercised.
+    mnexec -a "${HOST_PIDS[$dst]}" bash -lc "iperf -s -i 1" > /tmp/mtd_preflight_server.log 2>&1 &
+    PREFLIGHT_SRV_PID="$!"
+    sleep 1
+    mnexec -a "${HOST_PIDS[$src]}" bash -lc "iperf -c ${dst_ip} -t 2 -i 1" > /tmp/mtd_preflight_client.log 2>&1 || true
+    sleep 1
+    kill "$PREFLIGHT_SRV_PID" 2>/dev/null || true
+    stop_all_iperf
+
+    pre_lines="$(tail -n +$((pre_start + 1)) "$RYU_LOG" 2>/dev/null || true)"
+    if echo "$pre_lines" | grep -q 'TOPO_DISCOVERY_COMPLETE'; then
+        echo "[PREFLIGHT] OK: TOPO_DISCOVERY_COMPLETE"
+    else
+        echo "[PREFLIGHT][ERROR] Missing TOPO_DISCOVERY_COMPLETE"
+        preflight_ok=0
+    fi
+
+    if echo "$pre_lines" | grep -q 'RPPT_MEASURED'; then
+        echo "[PREFLIGHT] OK: RPPT_MEASURED"
+    else
+        echo "[PREFLIGHT][ERROR] Missing RPPT_MEASURED"
+        preflight_ok=0
+    fi
+
+    if echo "$pre_lines" | grep -q 'VIP_RECLAIMED'; then
+        echo "[PREFLIGHT] OK: VIP_RECLAIMED"
+    else
+        echo "[PREFLIGHT][WARN] VIP_RECLAIMED not seen in warm-up window (will still be checked in N4)"
+    fi
+
+    if [[ "$preflight_ok" -ne 1 ]]; then
+        echo "[PREFLIGHT] Missing required controller tokens — aborting early."
+        exit 1
+    fi
+}
+
 # ── Ryu log start position ────────────────────────────────────────────────────
 RYU_LOG_START=0
 if [[ -n "$RYU_LOG" && -f "$RYU_LOG" ]]; then
@@ -496,18 +552,30 @@ stop_all_iperf
         src="${PAIRS_SRC[$i]}"
         dst="${PAIRS_DST[$i]}"
         srv="${OUTDIR}/DE_udp_server_${dst}.txt"
+        cli="${OUTDIR}/DE_udp_client_${src}_to_${dst}.txt"
         # Parse from the iperf2 summary line: "0.0-XX.X sec ... Jitter Lost/Total"
         # Exclude "out-of-order" lines and per-second interval lines by matching
         # only lines that start with the full duration (0.0-) and have ms in them
         _srv_summary="$(grep -E '0\.0-[0-9]' "$srv" 2>/dev/null | \
                         grep -v 'out-of-order' | tail -1)"
+        _cli_summary="$(grep -E '0\.0-[0-9]' "$cli" 2>/dev/null | \
+                        grep -v 'out-of-order' | tail -1)"
         jitter="$(echo "$_srv_summary" | \
                   awk '{for(i=1;i<=NF;i++) if($i~/ms$/) {gsub("ms","",$i); print $i; exit}}' \
                   || echo 'N/A')"
+        [[ -z "$jitter" || "$jitter" == "N/A" ]] && \
+            jitter="$(echo "$_cli_summary" | \
+                      awk '{for(i=1;i<=NF;i++) if($i~/ms$/) {gsub("ms","",$i); print $i; exit}}' \
+                      || echo 'N/A')"
         loss="$(echo "$_srv_summary" | \
                 grep -oE '[0-9]+/ +[0-9]+' | tr -d ' ' | tail -1 || \
                 echo "$_srv_summary" | grep -oE '[0-9]+/[0-9]+' | tail -1 || \
                 echo 'N/A')"
+        [[ -z "$loss" || "$loss" == "N/A" ]] && \
+            loss="$(echo "$_cli_summary" | \
+                    grep -oE '[0-9]+/ +[0-9]+' | tr -d ' ' | tail -1 || \
+                    echo "$_cli_summary" | grep -oE '[0-9]+/[0-9]+' | tail -1 || \
+                    echo 'N/A')"
         printf "%-30s %-12s %-15s\n" "${src}->${dst}" "$jitter" "$loss"
     done
 } > "${OUTDIR}/DE_udp_summary.txt"

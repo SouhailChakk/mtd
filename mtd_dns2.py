@@ -1,4 +1,6 @@
 import socket
+import json
+import os
 from time import time
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -44,6 +46,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     EXPECTED_SWITCHES = 2
     EXPECTED_DIRECTED_LINKS = 2
     EXPECTED_HOSTS = 0  # 0 = do not wait for host discovery
+    TOPO_EXPECTATION_FILE = "/tmp/mtd_topology_expectations.json"
 
     VIP_STATE_PRIMARY = "PRIMARY"
     VIP_STATE_GRACE = "GRACE"
@@ -89,6 +92,8 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.discovery_end_time: Optional[float] = None
         self.discovery_completed = False
         self.discovery_completion_reason = ""
+        self._topology_expectations_loaded = False
+        self._load_topology_expectations()
 
     # ---------------- lifecycle ----------------
 
@@ -110,6 +115,10 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     def _housekeeping(self, ev):
         """Periodic housekeeping tasks."""
         now = time()
+        if not self._topology_expectations_loaded:
+            self._load_topology_expectations()
+        # If topology events were missed during startup, keep checking until complete.
+        self._maybe_complete_discovery("housekeeping")
         # Proactive host discovery
         self._proactive_discovery(now)
 
@@ -760,6 +769,34 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         num_hosts = len(self.detected_hosts)
         return num_switches, num_directed_links, num_hosts
 
+    def _load_topology_expectations(self):
+        """Load expected switch/link/host counts written by industry_topo.py."""
+        path = self.TOPO_EXPECTATION_FILE
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            expected_switches = int(data.get("expected_switches", self.EXPECTED_SWITCHES))
+            expected_directed_links = int(data.get("expected_directed_links", self.EXPECTED_DIRECTED_LINKS))
+            expected_hosts = int(data.get("expected_hosts", self.EXPECTED_HOSTS))
+            if expected_switches > 0:
+                self.EXPECTED_SWITCHES = expected_switches
+            if expected_directed_links > 0:
+                self.EXPECTED_DIRECTED_LINKS = expected_directed_links
+            if expected_hosts >= 0:
+                self.EXPECTED_HOSTS = expected_hosts
+            self._topology_expectations_loaded = True
+            self.logger.info(
+                "TOPO_EXPECT: loaded from %s -> switches=%d directed_links=%d hosts=%d",
+                path,
+                self.EXPECTED_SWITCHES,
+                self.EXPECTED_DIRECTED_LINKS,
+                self.EXPECTED_HOSTS,
+            )
+        except Exception as e:
+            self.logger.warning("TOPO_EXPECT: failed to load %s: %s", path, e)
+
     def _maybe_complete_discovery(self, reason: str):
         if self.discovery_completed:
             return
@@ -1052,7 +1089,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
 
         self.vip_state.pop(vip, None)
         self.vip_mac_map.pop(vip, None)
-        self.vip_created_at.pop(vip, None)
+        created_at = self.vip_created_at.pop(vip, None)
         self.vip_flow_refs.pop(vip, None)
         self.vip_session_refs.pop(vip, None)
         self.vip_last_seen.pop(vip, None)
@@ -1064,6 +1101,11 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.quarantine_until[vip] = time() + self.VIP_QUARANTINE_SECONDS
 
         self.logger.info("RECLAIM: VIP %s from host %s -> quarantine %ss", vip, owner, self.VIP_QUARANTINE_SECONDS)
+        if created_at is not None:
+            lived_ms = (time() - created_at) * 1000.0
+            self.logger.info("VIP_RECLAIMED: vip=%s lived_ms=%.3f", vip, lived_ms)
+        else:
+            self.logger.info("VIP_RECLAIMED: vip=%s lived_ms=UNKNOWN", vip)
         # Update DNS mapping file
         self._update_dns_mapping()
 
@@ -1083,9 +1125,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         DNS server reloads this file on each query to always return the latest
         PRIMARY VIPs, which rotate every ROTATE_INTERVAL (60s).
         """
-        import json
-        import os
-        
         # Map real IPs to their current PRIMARY VIPs
         mapping = {}
         for host_ip, vip in self.primary_vip.items():
