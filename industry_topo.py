@@ -83,7 +83,7 @@ HOST_SUBNET_USABLE = HOST_SUBNET_SIZE - 2
 def host_ip_from_index(host_index):
     """
     Return the Nth usable host IP in 10.0.0.0/21 (1-based).
-    Uses full sequential progression, e.g.:
+    Uses full octet progression, e.g.:
       1   -> 10.0.0.1
       255 -> 10.0.0.255
       256 -> 10.0.1.0
@@ -92,27 +92,6 @@ def host_ip_from_index(host_index):
     if host_index < 1 or host_index > HOST_SUBNET_USABLE:
         raise ValueError('host_index must be in [1, %d]' % HOST_SUBNET_USABLE)
     ip_int = HOST_SUBNET_NETWORK_INT + host_index
-    return '%d.%d.%d.%d' % (
-        (ip_int >> 24) & 0xFF,
-        (ip_int >> 16) & 0xFF,
-        (ip_int >> 8) & 0xFF,
-        ip_int & 0xFF,
-    )
-
-
-def host_ip_from_index(host_index):
-    """
-    Return the Nth real host IP in 10.0.0.0/8 (1-based).
-    Uses full octet progression, e.g.:
-      1   -> 10.0.0.1
-      255 -> 10.0.0.255
-      256 -> 10.0.1.0
-      512 -> 10.0.2.0
-    """
-    if host_index < 1:
-        raise ValueError('host_index must be >= 1')
-    base_int = (10 << 24)
-    ip_int = base_int + host_index
     return '%d.%d.%d.%d' % (
         (ip_int >> 24) & 0xFF,
         (ip_int >> 16) & 0xFF,
@@ -163,6 +142,7 @@ class FatTreeTopo(Topo):
             sw = self.addSwitch(
                 'core%d' % (c + 1),
                 cls=OVSKernelSwitch,
+                failMode='standalone',
                 dpid='%016x' % (c + 1)
             )
             core_switches.append(sw)
@@ -179,6 +159,7 @@ class FatTreeTopo(Topo):
             sw = self.addSwitch(
                 'agg%d' % (a + 1),
                 cls=OVSKernelSwitch,
+                failMode='standalone',
                 dpid='%016x' % (100 + a + 1)
             )
             agg_switches.append(sw)
@@ -195,6 +176,7 @@ class FatTreeTopo(Topo):
             edge_sw = self.addSwitch(
                 'edge%d' % (e + 1),
                 cls=OVSKernelSwitch,
+                failMode='standalone',
                 dpid='%016x' % (200 + e + 1)
             )
 
@@ -206,7 +188,7 @@ class FatTreeTopo(Topo):
 
             # Connect hosts to this edge switch
             for h in range(hosts_per_edge):
-                ip  = '%s/8' % host_ip_from_index(host_id)
+                ip  = '%s/%d' % (host_ip_from_index(host_id), HOST_SUBNET_PREFIX)
                 mac = '00:00:00:00:%02x:%02x' % (
                     host_id // 256,
                     host_id % 256
