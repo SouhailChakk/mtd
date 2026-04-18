@@ -1,6 +1,4 @@
 import socket
-import json
-import os
 from time import time
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -34,8 +32,8 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     VIP_QUARANTINE_SECONDS = 30
     # GRACE VIPs: If idle when moved to GRACE (flow_refs = 0), reclaim immediately (return to pool)
     #             If active when moved to GRACE (flow_refs > 0), keep until flows end
-    DISCOVERY_MAX_HOSTS = 512
-    VIP_POOL_START = "10.0.3.1"
+    DISCOVERY_RANGE_LAST_OCTET_MAX = 10
+    VIP_POOL_START = "10.0.0.11"
 
     FLOW_PRIORITY_VIP = 100
     COOKIE_BASE = 0xA000_0000_0000_0000
@@ -46,7 +44,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     EXPECTED_SWITCHES = 2
     EXPECTED_DIRECTED_LINKS = 2
     EXPECTED_HOSTS = 0  # 0 = do not wait for host discovery
-    TOPO_EXPECTATION_FILE = "/tmp/mtd_topology_expectations.json"
 
     VIP_STATE_PRIMARY = "PRIMARY"
     VIP_STATE_GRACE = "GRACE"
@@ -63,7 +60,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.datapaths: Set["ryu.controller.controller.Datapath"] = set()
         
         # Host discovery and mapping
-        self.detected_hosts: Set[str] = set()  # Set of discovered real host IPs (10.0.x.y host plan)
+        self.detected_hosts: Set[str] = set()  # Set of discovered real host IPs (10.0.0.1-10.0.0.10)
         self.host_ip_to_mac: Dict[str, str] = {}  # Real host IP -> MAC address
         
         # VIP assignment and state
@@ -92,8 +89,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.discovery_end_time: Optional[float] = None
         self.discovery_completed = False
         self.discovery_completion_reason = ""
-        self._topology_expectations_loaded = False
-        self._load_topology_expectations()
 
     # ---------------- lifecycle ----------------
 
@@ -115,10 +110,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     def _housekeeping(self, ev):
         """Periodic housekeeping tasks."""
         now = time()
-        if not self._topology_expectations_loaded:
-            self._load_topology_expectations()
-        # If topology events were missed during startup, keep checking until complete.
-        self._maybe_complete_discovery("housekeeping")
         # Proactive host discovery
         self._proactive_discovery(now)
 
@@ -228,27 +219,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     def _ip_to_int(self, ip: str) -> int:
         p = ip.split('.')
         return (int(p[0]) << 24) + (int(p[1]) << 16) + (int(p[2]) << 8) + int(p[3])
-
-    def _host_id_to_ip(self, host_id: int) -> str:
-        """Map Mininet host index (h1..hN) to 10.0.x.y, matching industry topology."""
-        o2 = (host_id - 1) // 254
-        o3 = ((host_id - 1) % 254) + 1
-        return f"10.0.{o2}.{o3}"
-
-    def _is_discovery_host_ip(self, ip: str) -> bool:
-        """Return True for real host IPs in the industry topology address plan."""
-        try:
-            o1, o2, o3, o4 = [int(x) for x in ip.split(".")]
-        except Exception:
-            return False
-        if o1 != 10 or o2 != 0:
-            return False
-        if o3 < 0:
-            return False
-        if o4 < 1 or o4 > 254:
-            return False
-        host_id = (o3 * 254) + o4
-        return 1 <= host_id <= self.DISCOVERY_MAX_HOSTS
 
     def _vip_cookie(self, vip: str) -> int:
         return self.COOKIE_BASE | (self._ip_to_int(vip) & self.COOKIE_VIP_MASK)
@@ -541,9 +511,9 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         # IMPORTANT: Once flows are installed, never reinstall them (for both TCP and UDP).
         # If flows expire (flow_refs == 0), the session is still active (session_refs > 0 for pinned sessions).
         # For both TCP and UDP: session_refs keeps VIP active even if flows expire
-        if sess.get("flows_installed") or sess.get("flow_install_in_progress"):
+        if sess.get("flows_installed"):
             self.logger.debug(
-                "SESSION_FLOW_SKIP: flows already installed/in-progress for session "
+                "SESSION_FLOW_SKIP: flows already installed for session "
                 "(client_ip=%s server_vip=%s proto=%s src_port=%s dst_port=%s)",
                 sess.get("client_real_ip"),
                 sess.get("server_vip"),
@@ -552,10 +522,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                 l4_info.get("dst_port"),
             )
             return True
-
-        # Guard against back-to-back PacketIn events for the same session arriving
-        # before the first FlowMod batch is fully processed.
-        sess["flow_install_in_progress"] = True
 
         # RPPT: use PacketIn start time so we measure PacketIn -> last FlowMod (same scope as baseline)
         if rppt_start is None:
@@ -571,7 +537,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         dst_vip_mac = self._ensure_vip_mac(server_reply_vip)
         if not src_vip_mac or not dst_vip_mac:
             self.logger.warning("SESSION: Missing VIP MAC(s) for %s -> %s", client_vip, server_reply_vip)
-            sess.pop("flow_install_in_progress", None)
             return False
 
         dst_port = self.mac_to_port.get(dp.id, {}).get(dst_real_mac, ofp.OFPP_FLOOD)
@@ -650,7 +615,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.logger.info("RPPT_MEASURED: key=%s elapsed_ms=%.3f", rppt_key, elapsed_ms)
         # Mark flows as installed to prevent duplicate installation on subsequent packets
         sess["flows_installed"] = True
-        sess.pop("flow_install_in_progress", None)
         return True
 
     def _handle_l4_session(self, msg, dp, pkt, in_port, src_real, dst_vip, rppt_start=None) -> bool:
@@ -775,34 +739,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         num_hosts = len(self.detected_hosts)
         return num_switches, num_directed_links, num_hosts
 
-    def _load_topology_expectations(self):
-        """Load expected switch/link/host counts written by industry_topo.py."""
-        path = self.TOPO_EXPECTATION_FILE
-        if not os.path.exists(path):
-            return
-        try:
-            with open(path, "r") as f:
-                data = json.load(f)
-            expected_switches = int(data.get("expected_switches", self.EXPECTED_SWITCHES))
-            expected_directed_links = int(data.get("expected_directed_links", self.EXPECTED_DIRECTED_LINKS))
-            expected_hosts = int(data.get("expected_hosts", self.EXPECTED_HOSTS))
-            if expected_switches > 0:
-                self.EXPECTED_SWITCHES = expected_switches
-            if expected_directed_links > 0:
-                self.EXPECTED_DIRECTED_LINKS = expected_directed_links
-            if expected_hosts >= 0:
-                self.EXPECTED_HOSTS = expected_hosts
-            self._topology_expectations_loaded = True
-            self.logger.info(
-                "TOPO_EXPECT: loaded from %s -> switches=%d directed_links=%d hosts=%d",
-                path,
-                self.EXPECTED_SWITCHES,
-                self.EXPECTED_DIRECTED_LINKS,
-                self.EXPECTED_HOSTS,
-            )
-        except Exception as e:
-            self.logger.warning("TOPO_EXPECT: failed to load %s: %s", path, e)
-
     def _maybe_complete_discovery(self, reason: str):
         if self.discovery_completed:
             return
@@ -918,13 +854,14 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         if not real_ip:
             return
 
-        # Only learn real hosts from the expected industry topology addressing plan.
-        # Keep controller/VIP/session behavior untouched by filtering with host MAC scheme.
-        if not self._is_discovery_host_ip(real_ip):
-            return
-        if not mac or mac.lower() == self.CONTROLLER_DISCOVERY_MAC.lower():
-            return
-        if not mac.lower().startswith("00:00:00:00:"):
+        # Only learn hosts in discovery range
+        try:
+            if not real_ip.startswith("10.0.0."):
+                return
+            last = int(real_ip.split(".")[-1])
+            if last < 1 or last > self.DISCOVERY_RANGE_LAST_OCTET_MAX:
+                return
+        except Exception:
             return
 
         # Update host info
@@ -977,8 +914,8 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         if not hasattr(self, '_last_discovery'):
             self._last_discovery = {}
 
-        for host_id in range(1, self.DISCOVERY_MAX_HOSTS + 1):
-            target_ip = self._host_id_to_ip(host_id)
+        for last_octet in range(1, self.DISCOVERY_RANGE_LAST_OCTET_MAX + 1):
+            target_ip = f"10.0.0.{last_octet}"
 
             if target_ip in self.detected_hosts:
                 continue
@@ -1095,7 +1032,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
 
         self.vip_state.pop(vip, None)
         self.vip_mac_map.pop(vip, None)
-        created_at = self.vip_created_at.pop(vip, None)
+        self.vip_created_at.pop(vip, None)
         self.vip_flow_refs.pop(vip, None)
         self.vip_session_refs.pop(vip, None)
         self.vip_last_seen.pop(vip, None)
@@ -1107,11 +1044,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.quarantine_until[vip] = time() + self.VIP_QUARANTINE_SECONDS
 
         self.logger.info("RECLAIM: VIP %s from host %s -> quarantine %ss", vip, owner, self.VIP_QUARANTINE_SECONDS)
-        if created_at is not None:
-            lived_ms = (time() - created_at) * 1000.0
-            self.logger.info("VIP_RECLAIMED: vip=%s lived_ms=%.3f", vip, lived_ms)
-        else:
-            self.logger.info("VIP_RECLAIMED: vip=%s lived_ms=UNKNOWN", vip)
         # Update DNS mapping file
         self._update_dns_mapping()
 
@@ -1131,6 +1063,9 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         DNS server reloads this file on each query to always return the latest
         PRIMARY VIPs, which rotate every ROTATE_INTERVAL (60s).
         """
+        import json
+        import os
+        
         # Map real IPs to their current PRIMARY VIPs
         mapping = {}
         for host_ip, vip in self.primary_vip.items():
