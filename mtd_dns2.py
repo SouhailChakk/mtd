@@ -21,7 +21,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
     _EVENTS = [EventMessage]
 
-    NUM_VIPS = 6000
+    NUM_VIPS = 8000
     HOUSEKEEPING_INTERVAL = 15
     ROTATE_INTERVAL = 60
     TCP_SYN_SEEN_TIMEOUT = 15
@@ -42,7 +42,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     CONTROLLER_DISCOVERY_IP = "10.0.0.254"
 
     # Topology discovery: switches + links only (hosts excluded for fair benchmark)
-    EXPECTED_SWITCHES = 2
+    EXPECTED_SWITCHES = 28
     EXPECTED_DIRECTED_LINKS = 2
     EXPECTED_HOSTS = 0  # 0 = do not wait for host discovery
 
@@ -196,17 +196,15 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     # ---------------- utils ----------------
 
     def _generate_vips(self, start_ip: str, count: int) -> List[str]:
+        base = list(map(int, start_ip.split('.')))
         out: List[str] = []
-        current = self._ip_to_int(start_ip)
-        while len(out) < count and current < self.VIP_SUBNET_BROADCAST_INT:
-            if self.VIP_SUBNET_NETWORK_INT < current < self.VIP_SUBNET_BROADCAST_INT:
-                out.append(self._int_to_ip(current))
-            current += 1
-        if len(out) < count:
-            self.logger.warning(
-                "VIP_POOL: Requested %d VIPs from %s but only %d usable addresses fit in 10.0.0.0/%d",
-                count, start_ip, len(out), self.VIP_SUBNET_PREFIX
-            )
+        for _ in range(count):
+            out.append('.'.join(map(str, base)))
+            base[3] += 1
+            for i in (3, 2, 1):
+                if base[i] > 255:
+                    base[i] = 0
+                    base[i - 1] += 1
         return out
 
     def _generate_vip_mac(self, vip_ip: str) -> str:
