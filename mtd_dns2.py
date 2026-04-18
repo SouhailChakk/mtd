@@ -1,6 +1,7 @@
 import socket
 from time import time
 from typing import Dict, List, Optional, Set, Tuple
+import ipaddress
 
 from ryu.base import app_manager
 from ryu.controller import event, ofp_event
@@ -32,14 +33,16 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     VIP_QUARANTINE_SECONDS = 30
     # GRACE VIPs: If idle when moved to GRACE (flow_refs = 0), reclaim immediately (return to pool)
     #             If active when moved to GRACE (flow_refs > 0), keep until flows end
-    REAL_HOST_POOL_SIZE = 512
+    REAL_HOST_SUBNET = "10.0.0.0/8"
+    REAL_HOST_POOL_SIZE = (1 << (32 - 8)) - 2
+    PROACTIVE_DISCOVERY_BATCH = 512
     VIP_POOL_START = "10.0.2.1"
 
     FLOW_PRIORITY_VIP = 100
     COOKIE_BASE = 0xA000_0000_0000_0000
     COOKIE_VIP_MASK = 0xFFFF_FFFF
     CONTROLLER_DISCOVERY_MAC = "02:00:00:00:00:fe"
-    CONTROLLER_DISCOVERY_IP = "10.0.0.254"
+    CONTROLLER_DISCOVERY_IP = "10.255.255.254"
 
     # Topology discovery: switches + links only (hosts excluded for fair benchmark)
     EXPECTED_SWITCHES = 28
@@ -90,6 +93,8 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.discovery_end_time: Optional[float] = None
         self.discovery_completed = False
         self.discovery_completion_reason = ""
+        self.real_host_network = ipaddress.ip_network(self.REAL_HOST_SUBNET, strict=False)
+        self._discovery_next_host_index = 1
 
     # ---------------- lifecycle ----------------
 
@@ -236,11 +241,10 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
 
     def _is_real_host_pool_ip(self, ip: str) -> bool:
         try:
-            ip_int = self._ip_to_int(ip)
+            addr = ipaddress.ip_address(ip)
         except Exception:
             return False
-        base = (10 << 24)
-        return base + 1 <= ip_int <= base + self.REAL_HOST_POOL_SIZE
+        return addr in self.real_host_network
 
     def _vip_cookie(self, vip: str) -> int:
         return self.COOKIE_BASE | (self._ip_to_int(vip) & self.COOKIE_VIP_MASK)
@@ -876,7 +880,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         if not real_ip:
             return
 
-        # Only learn hosts from the real-host pool (first 512 IPs in 10.0.0.0/8)
+        # Only learn hosts from the configured real-host subnet.
         if not self._is_real_host_pool_ip(real_ip):
             return
 
@@ -930,7 +934,13 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         if not hasattr(self, '_last_discovery'):
             self._last_discovery = {}
 
-        for host_index in range(1, self.REAL_HOST_POOL_SIZE + 1):
+        if self.REAL_HOST_POOL_SIZE <= 0:
+            return
+
+        start = self._discovery_next_host_index
+        end = min(self.REAL_HOST_POOL_SIZE, start + self.PROACTIVE_DISCOVERY_BATCH - 1)
+
+        for host_index in range(start, end + 1):
             target_ip = self._host_ip_from_index(host_index)
 
             if target_ip in self.detected_hosts:
@@ -955,7 +965,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                     p.add_protocol(arp.arp(
                         opcode=arp.ARP_REQUEST,
                         src_mac=self.CONTROLLER_DISCOVERY_MAC,
-                        src_ip='10.255.255.254',
+                        src_ip=self.CONTROLLER_DISCOVERY_IP,
                         dst_mac='00:00:00:00:00:00',
                         dst_ip=target_ip
                     ))
@@ -969,6 +979,10 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                     ))
                 except Exception as e:
                     self.logger.debug("Discovery ARP to %s failed: %s", target_ip, e)
+
+        self._discovery_next_host_index = end + 1
+        if self._discovery_next_host_index > self.REAL_HOST_POOL_SIZE:
+            self._discovery_next_host_index = 1
 
     # ---------------- logging ----------------
 
