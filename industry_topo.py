@@ -42,7 +42,6 @@ from mininet.node import OVSKernelSwitch, RemoteController
 from mininet.cli import CLI
 from mininet.log import setLogLevel
 import sys
-import math
 import json
 
 
@@ -74,6 +73,27 @@ FAT_TREE_CONFIGS = {
     24: {'n_core': 4, 'n_agg': 8,  'n_edge': 9,  'hosts_per_edge': 12, 'uplinks': 2},
     48: {'n_core': 4, 'n_agg': 8,  'n_edge': 16, 'hosts_per_edge': 32, 'uplinks': 2},
 }
+
+
+def host_ip_from_index(host_index):
+    """
+    Return the Nth real host IP in 10.0.0.0/8 (1-based).
+    Uses full octet progression, e.g.:
+      1   -> 10.0.0.1
+      255 -> 10.0.0.255
+      256 -> 10.0.1.0
+      512 -> 10.0.2.0
+    """
+    if host_index < 1:
+        raise ValueError('host_index must be >= 1')
+    base_int = (10 << 24)
+    ip_int = base_int + host_index
+    return '%d.%d.%d.%d' % (
+        (ip_int >> 24) & 0xFF,
+        (ip_int >> 16) & 0xFF,
+        (ip_int >> 8) & 0xFF,
+        ip_int & 0xFF,
+    )
 
 
 class FatTreeTopo(Topo):
@@ -155,12 +175,7 @@ class FatTreeTopo(Topo):
 
             # Connect hosts to this edge switch
             for h in range(hosts_per_edge):
-                # Spread hosts across octets to avoid /24 overflow
-                # h1-h254   -> 10.0.0.1-254
-                # h255-h508 -> 10.0.1.1-254  etc.
-                _o2 = (host_id - 1) // 254
-                _o3 = ((host_id - 1) % 254) + 1
-                ip  = '10.0.%d.%d/8' % (_o2, _o3)
+                ip  = '%s/8' % host_ip_from_index(host_id)
                 mac = '00:00:00:00:%02x:%02x' % (
                     host_id // 256,
                     host_id % 256
@@ -208,10 +223,9 @@ def run(port_count):
     print('  Edge  switches : %d  (each with %d redundant uplinks to agg)' % (
         topo.n_edge, topo.n_uplinks))
     print('  Total switches : %d' % (topo.n_core + topo.n_agg + topo.n_edge))
-    _last_o2 = (topo.n_hosts - 1) // 254
-    _last_o3 = ((topo.n_hosts - 1) % 254) + 1
-    print('  Total hosts    : %d  (10.0.0.1 - 10.0.%d.%d)' % (
-        topo.n_hosts, _last_o2, _last_o3))
+    _last_ip = host_ip_from_index(topo.n_hosts)
+    print('  Total hosts    : %d  (10.0.0.1 - %s)' % (
+        topo.n_hosts, _last_ip))
     print('  Total devices  : %d' % (
         topo.n_core + topo.n_agg + topo.n_edge + topo.n_hosts))
     print('  Hosts/edge sw  : %d' % cfg['hosts_per_edge'])
@@ -221,8 +235,7 @@ def run(port_count):
     print('    Core mesh ensures no single core switch is a bottleneck')
     print('    Any single switch or link failure is automatically rerouted')
     print('')
-    _last_o2 = (topo.n_hosts - 1) // 254
-    _vip_start = '10.0.%d.1' % (_last_o2 + 1)
+    _vip_start = host_ip_from_index(topo.n_hosts + 1)
     print('  VIPs start at  : %s' % _vip_start)
     print('  Subnet         : 10.0.0.0/8  (hosts + VIPs across octets)')
     print('=' * 62)
