@@ -33,8 +33,8 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     VIP_QUARANTINE_SECONDS = 30
     # GRACE VIPs: If idle when moved to GRACE (flow_refs = 0), reclaim immediately (return to pool)
     #             If active when moved to GRACE (flow_refs > 0), keep until flows end
-    REAL_HOST_SUBNET = "10.0.0.0/8"
-    REAL_HOST_POOL_SIZE = (1 << (32 - 8)) - 2
+    REAL_HOST_SUBNET = "10.0.0.0/21"
+    REAL_HOST_POOL_SIZE = 512
     PROACTIVE_DISCOVERY_BATCH = 512
     VIP_POOL_START = "10.0.2.1"
 
@@ -94,6 +94,8 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.discovery_completed = False
         self.discovery_completion_reason = ""
         self.real_host_network = ipaddress.ip_network(self.REAL_HOST_SUBNET, strict=False)
+        self._real_host_min_int = int(self.real_host_network.network_address) + 1
+        self._real_host_max_int = self._real_host_min_int + self.REAL_HOST_POOL_SIZE - 1
         self._discovery_next_host_index = 1
 
     # ---------------- lifecycle ----------------
@@ -235,16 +237,23 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         ])
 
     def _host_ip_from_index(self, host_index: int) -> str:
-        if host_index < 1:
-            raise ValueError("host_index must be >= 1")
-        return self._int_to_ip((10 << 24) + host_index)
+        if host_index < 1 or host_index > self.REAL_HOST_POOL_SIZE:
+            raise ValueError("host_index must be in [1, %d]" % self.REAL_HOST_POOL_SIZE)
+        return self._int_to_ip(self._real_host_min_int + host_index - 1)
 
     def _is_real_host_pool_ip(self, ip: str) -> bool:
         try:
             addr = ipaddress.ip_address(ip)
         except Exception:
             return False
-        return addr in self.real_host_network
+        if addr not in self.real_host_network:
+            return False
+        addr_int = int(addr)
+        if addr_int < self._real_host_min_int or addr_int > self._real_host_max_int:
+            return False
+        if ip == self.CONTROLLER_DISCOVERY_IP:
+            return False
+        return True
 
     def _vip_cookie(self, vip: str) -> int:
         return self.COOKIE_BASE | (self._ip_to_int(vip) & self.COOKIE_VIP_MASK)
