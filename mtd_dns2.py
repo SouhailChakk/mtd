@@ -47,7 +47,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     EXPECTED_DIRECTED_LINKS = 2
     EXPECTED_HOSTS = 0  # 0 = do not wait for host discovery
     TOPO_EXPECTATION_FILE = "/tmp/mtd_topology_expectations.json"
-    USE_TOPO_EXPECTATIONS = False
 
     VIP_STATE_PRIMARY = "PRIMARY"
     VIP_STATE_GRACE = "GRACE"
@@ -94,10 +93,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.discovery_completed = False
         self.discovery_completion_reason = ""
         self._topology_expectations_loaded = False
-        env_use_expect = os.environ.get("MTD_USE_TOPO_EXPECTATIONS", "").strip().lower()
-        self.use_topology_expectations = self.USE_TOPO_EXPECTATIONS or env_use_expect in ("1", "true", "yes", "on")
-        if self.use_topology_expectations:
-            self._load_topology_expectations()
+        self._load_topology_expectations()
 
     # ---------------- lifecycle ----------------
 
@@ -119,7 +115,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     def _housekeeping(self, ev):
         """Periodic housekeeping tasks."""
         now = time()
-        if self.use_topology_expectations and not self._topology_expectations_loaded:
+        if not self._topology_expectations_loaded:
             self._load_topology_expectations()
         # If topology events were missed during startup, keep checking until complete.
         self._maybe_complete_discovery("housekeeping")
