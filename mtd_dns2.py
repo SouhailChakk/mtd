@@ -32,10 +32,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     VIP_QUARANTINE_SECONDS = 30
     # GRACE VIPs: If idle when moved to GRACE (flow_refs = 0), reclaim immediately (return to pool)
     #             If active when moved to GRACE (flow_refs > 0), keep until flows end
-    DISCOVERY_REAL_IP_PREFIX = "10.0."
-    DISCOVERY_SCAN_START_IP = "10.0.0.1"
-    PROACTIVE_DISCOVERY_MAX_TARGETS = 1024
-    PROACTIVE_DISCOVERY_INTERVAL = 60
+    DISCOVERY_RANGE_LAST_OCTET_MAX = 10
     VIP_POOL_START = "10.0.0.11"
 
     FLOW_PRIORITY_VIP = 100
@@ -92,7 +89,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         self.discovery_end_time: Optional[float] = None
         self.discovery_completed = False
         self.discovery_completion_reason = ""
-        self.discovery_targets: List[str] = self._build_discovery_targets()
 
     # ---------------- lifecycle ----------------
 
@@ -223,20 +219,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     def _ip_to_int(self, ip: str) -> int:
         p = ip.split('.')
         return (int(p[0]) << 24) + (int(p[1]) << 16) + (int(p[2]) << 8) + int(p[3])
-
-    def _int_to_ip(self, value: int) -> str:
-        return ".".join(str((value >> shift) & 0xFF) for shift in (24, 16, 8, 0))
-
-    def _build_discovery_targets(self) -> List[str]:
-        """Build deterministic ARP probe targets for larger topologies."""
-        start_int = self._ip_to_int(self.DISCOVERY_SCAN_START_IP)
-        targets: List[str] = []
-        for offset in range(self.PROACTIVE_DISCOVERY_MAX_TARGETS):
-            target_ip = self._int_to_ip(start_int + offset)
-            if target_ip == "10.0.0.254":
-                continue
-            targets.append(target_ip)
-        return targets
 
     def _vip_cookie(self, vip: str) -> int:
         return self.COOKIE_BASE | (self._ip_to_int(vip) & self.COOKIE_VIP_MASK)
@@ -872,16 +854,12 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         if not real_ip:
             return
 
-        # Learn hosts in the controller real-host prefix (supports multi-octet ranges).
+        # Only learn hosts in discovery range
         try:
-            if not real_ip.startswith(self.DISCOVERY_REAL_IP_PREFIX):
+            if not real_ip.startswith("10.0.0."):
                 return
-            octets = [int(x) for x in real_ip.split(".")]
-            if len(octets) != 4:
-                return
-            if any(o < 0 or o > 255 for o in octets):
-                return
-            if real_ip == "10.0.0.254":
+            last = int(real_ip.split(".")[-1])
+            if last < 1 or last > self.DISCOVERY_RANGE_LAST_OCTET_MAX:
                 return
         except Exception:
             return
@@ -936,13 +914,14 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         if not hasattr(self, '_last_discovery'):
             self._last_discovery = {}
 
-        for target_ip in self.discovery_targets:
+        for last_octet in range(1, self.DISCOVERY_RANGE_LAST_OCTET_MAX + 1):
+            target_ip = f"10.0.0.{last_octet}"
 
             if target_ip in self.detected_hosts:
                 continue
 
             if target_ip in self._last_discovery:
-                if now - self._last_discovery[target_ip] < self.PROACTIVE_DISCOVERY_INTERVAL:
+                if now - self._last_discovery[target_ip] < 60:
                     continue
 
             self._last_discovery[target_ip] = now
