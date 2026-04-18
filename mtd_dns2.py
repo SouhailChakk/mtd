@@ -34,10 +34,6 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
     #             If active when moved to GRACE (flow_refs > 0), keep until flows end
     REAL_HOST_POOL_SIZE = 512
     VIP_POOL_START = "10.0.2.1"
-    HOST_SUBNET_NETWORK_INT = (10 << 24)  # 10.0.0.0
-    HOST_SUBNET_PREFIX = 22
-    HOST_SUBNET_SIZE = 1 << (32 - HOST_SUBNET_PREFIX)
-    HOST_SUBNET_BROADCAST_INT = HOST_SUBNET_NETWORK_INT + HOST_SUBNET_SIZE - 1
 
     FLOW_PRIORITY_VIP = 100
     COOKIE_BASE = 0xA000_0000_0000_0000
@@ -236,20 +232,17 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         ])
 
     def _host_ip_from_index(self, host_index: int) -> str:
-        max_usable = self.HOST_SUBNET_SIZE - 2
-        if host_index < 1 or host_index > max_usable:
-            raise ValueError("host_index must be in [1, %d]" % max_usable)
-        return self._int_to_ip(self.HOST_SUBNET_NETWORK_INT + host_index)
+        if host_index < 1:
+            raise ValueError("host_index must be >= 1")
+        return self._int_to_ip((10 << 24) + host_index)
 
     def _is_real_host_pool_ip(self, ip: str) -> bool:
         try:
             ip_int = self._ip_to_int(ip)
         except Exception:
             return False
-        if not (self.HOST_SUBNET_NETWORK_INT < ip_int < self.HOST_SUBNET_BROADCAST_INT):
-            return False
-        max_real_ip = self.HOST_SUBNET_NETWORK_INT + self.REAL_HOST_POOL_SIZE
-        return self.HOST_SUBNET_NETWORK_INT < ip_int <= max_real_ip
+        base = (10 << 24)
+        return base + 1 <= ip_int <= base + self.REAL_HOST_POOL_SIZE
 
     def _vip_cookie(self, vip: str) -> int:
         return self.COOKIE_BASE | (self._ip_to_int(vip) & self.COOKIE_VIP_MASK)
@@ -885,7 +878,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
         if not real_ip:
             return
 
-        # Only learn hosts from first 512 usable IPs in 10.0.0.0/22
+        # Only learn hosts from the real-host pool (first 512 IPs in 10.0.0.0/8)
         if not self._is_real_host_pool_ip(real_ip):
             return
 
@@ -964,7 +957,7 @@ class MovingTargetDefenseDNS(app_manager.RyuApp):
                     p.add_protocol(arp.arp(
                         opcode=arp.ARP_REQUEST,
                         src_mac=self.CONTROLLER_DISCOVERY_MAC,
-                        src_ip=self.CONTROLLER_DISCOVERY_IP,
+                        src_ip='10.255.255.254',
                         dst_mac='00:00:00:00:00:00',
                         dst_ip=target_ip
                     ))
