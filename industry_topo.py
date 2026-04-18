@@ -34,6 +34,7 @@ from mininet.cli import CLI
 from mininet.log import setLogLevel
 import sys
 import math
+import json
 
 
 # =============================================================================
@@ -158,6 +159,26 @@ class IndustryTopo(Topo):
 
 def run(port_count):
     topo = IndustryTopo(port_count=port_count)
+    expected_switches = topo.n_core + topo.n_agg + topo.n_edge
+    # Mininet/ryu topology API reports directed links (A->B and B->A).
+    # Physical links = agg-core + edge-agg + host-edge
+    # directed_links = physical_links * 2
+    physical_links = topo.n_agg + topo.n_edge + topo.n_hosts
+    expected_directed_links = physical_links * 2
+    topo_expect = {
+        "expected_switches": expected_switches,
+        "expected_directed_links": expected_directed_links,
+        "expected_hosts": 0,  # controller discovery check can ignore host count
+        "port_count": port_count,
+    }
+    topo_expect_path = "/tmp/mtd_topology_expectations.json"
+    try:
+        with open(topo_expect_path, "w") as f:
+            json.dump(topo_expect, f)
+        print('[TOPO] wrote expectations to %s: %s' % (topo_expect_path, topo_expect))
+    except Exception as e:
+        print('[TOPO][WARN] failed to write %s: %s' % (topo_expect_path, e))
+
     net  = Mininet(
         topo=topo,
         controller=RemoteController,
